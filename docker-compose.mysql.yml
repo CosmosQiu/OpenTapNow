@@ -1,0 +1,36 @@
+# ============================================
+# tapnow-online - Compose override for bundled MySQL
+# 用法: docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d --build
+# ============================================
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: tapnow-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword123}
+      MYSQL_DATABASE: tapnow_db
+      MYSQL_USER: tapnow
+      MYSQL_PASSWORD: ${TAPNOW_DB_PASSWORD:-tapnow123}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootpassword123}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  tapnow:
+    environment:
+      TAPNOW_DATABASE_URL: mysql+pymysql://tapnow:${TAPNOW_DB_PASSWORD:-tapnow123}@mysql:3306/tapnow_db?charset=utf8mb4
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+    driver: local

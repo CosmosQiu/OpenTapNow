@@ -1,0 +1,18 @@
+# Tapnow Local Server Python Dependencies
+# ========================================
+
+# 图像处理 (PNG转JPG功能)
+Pillow>=9.0.0
+
+# WebSocket 客户端 (ComfyUI 中间件)
+websocket-client>=1.0.0
+
+# YAML配置解析
+PyYAML>=6.0.0
+
+# MySQL + ORM
+SQLAlchemy>=2.0.0
+PyMySQL>=1.1.0
+
+# MySQL 8.0 认证支持 (caching_sha2_password)
+cryptography>=41.0.0

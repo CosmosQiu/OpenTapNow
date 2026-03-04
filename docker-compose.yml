@@ -1,0 +1,38 @@
+# ============================================
+# tapnow-online - Docker Compose (External MySQL by default)
+# 默认连接已有 MySQL；如需内置 MySQL，请叠加 docker-compose.mysql.yml
+# ============================================
+
+services:
+  tapnow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_LOCAL_SERVER_URL: ${VITE_LOCAL_SERVER_URL:-}
+    image: tapnow-online:latest
+    container_name: tapnow-online
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./tapnow_data:/app/data
+    environment:
+      TAPNOW_DATABASE_URL: "${TAPNOW_DATABASE_URL:-}"
+      TAPNOW_ENABLE_FILE_SERVER: "${TAPNOW_ENABLE_FILE_SERVER:-true}"
+      TAPNOW_ENABLE_PROXY: "${TAPNOW_ENABLE_PROXY:-true}"
+      TAPNOW_ENABLE_COMFY: "${TAPNOW_ENABLE_COMFY:-false}"
+      TAPNOW_ENABLE_LOG: "${TAPNOW_ENABLE_LOG:-true}"
+      TAPNOW_STATIC_DIR: "${TAPNOW_STATIC_DIR:-/app/static}"
+      TAPNOW_DEFAULT_ADMIN_USER: "${TAPNOW_DEFAULT_ADMIN_USER:-admin}"
+      TAPNOW_DEFAULT_ADMIN_PASSWORD: "${TAPNOW_DEFAULT_ADMIN_PASSWORD:-admin123}"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  tapnow_data:
+    driver: local
