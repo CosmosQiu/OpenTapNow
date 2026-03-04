@@ -1,4 +1,4 @@
-# tapnow-online
+# OpenTapNow
 
 前后端分离的单页应用，支持 Docker 一键部署，内置 MySQL 数据库支持。
 
