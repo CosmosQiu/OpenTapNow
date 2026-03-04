@@ -6458,7 +6458,7 @@ function TapnowApp() {
         try { return localStorage.getItem('tapnow_local_server_user') || 'admin'; } catch (e) { return 'admin'; }
     });
     const [localServerPassword] = useState(() => {
-        try { return localStorage.getItem('tapnow_local_server_password') || 'admin123'; } catch (e) { return 'admin123'; }
+        try { return localStorage.getItem('tapnow_local_server_password') || ''; } catch (e) { return ''; }
     });
     const buildLocalServerHeaders = useCallback((headers = {}) => {
         const next = { ...headers };

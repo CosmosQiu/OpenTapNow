@@ -142,7 +142,7 @@ export const LoginModal = ({ isOpen, onClose, onLogin, theme = 'dark' }) => {
                     </div>
 
                     <p className={`text-xs text-center ${isDark ? 'text-zinc-500' : 'text-zinc-400'}`}>
-                        默认账号: admin / admin123
+                        默认管理员账号由服务端环境变量配置
                     </p>
                 </form>
             </div>

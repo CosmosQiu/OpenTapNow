@@ -199,9 +199,11 @@ class DatabaseManager:
             workflow_count = conn.execute(select(func.count()).select_from(self.workflows)).scalar() or 0
             asset_count = conn.execute(select(func.count()).select_from(self.assets)).scalar() or 0
         print(f"[数据库] 初始化完成: 用户={user_count}, 项目={project_count}, 工作流={workflow_count}, 资源={asset_count}")
-        # 输出默认管理员信息
+        # 输出默认管理员信息（不打印密码）
         admin_user = os.environ.get("TAPNOW_DEFAULT_ADMIN_USER", "admin")
-        print(f"[数据库] 默认管理员账号: {admin_user} / {os.environ.get('TAPNOW_DEFAULT_ADMIN_PASSWORD', 'admin123')}")
+        print(f"[数据库] 默认管理员账号: {admin_user}")
+        if os.environ.get("TAPNOW_DEFAULT_ADMIN_PASSWORD", "please-change-me") == "please-change-me":
+            print("[安全提醒] 检测到默认管理员密码占位值，请在部署前设置 TAPNOW_DEFAULT_ADMIN_PASSWORD。")
 
     def _ensure_mysql_asset_blob_capacity(self):
         if not self.database_url.startswith("mysql") or not self.engine:
@@ -250,7 +252,7 @@ class DatabaseManager:
 
     def _ensure_default_admin(self):
         username = os.environ.get("TAPNOW_DEFAULT_ADMIN_USER", "admin")
-        password = os.environ.get("TAPNOW_DEFAULT_ADMIN_PASSWORD", "admin123")
+        password = os.environ.get("TAPNOW_DEFAULT_ADMIN_PASSWORD", "please-change-me")
         now = _now_ts()
         with self.connection() as conn:
             row = conn.execute(select(self.users.c.id).where(self.users.c.username == username)).first()

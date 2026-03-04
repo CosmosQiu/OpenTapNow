@@ -31,9 +31,9 @@
 # 1. 复制环境变量模板
 cp .env.example .env
 
-# 2. （重要）设置默认管理员账号（建议改掉默认密码）
+# 2. （重要）设置默认管理员账号（必须设置强密码）
 # TAPNOW_DEFAULT_ADMIN_USER=admin
-# TAPNOW_DEFAULT_ADMIN_PASSWORD=admin123
+# TAPNOW_DEFAULT_ADMIN_PASSWORD=please-change-me
 ```
 
 编辑 `.env`，至少确认以下变量：
@@ -134,7 +134,7 @@ docker build -t tapnow-online:latest .
 docker run -d --name tapnow-online \
   -p 8080:8080 \
   -v ./tapnow_data:/app/data \
-  -e TAPNOW_DATABASE_URL="mysql+pymysql://tapnow:tapnow123@host.docker.internal:3306/tapnow_db?charset=utf8mb4" \
+  -e TAPNOW_DATABASE_URL="mysql+pymysql://tapnow:change-me-db-password@host.docker.internal:3306/tapnow_db?charset=utf8mb4" \
   -e TAPNOW_DEFAULT_ADMIN_USER="admin" \
   -e TAPNOW_DEFAULT_ADMIN_PASSWORD="please-change-me" \
   tapnow-online:latest
@@ -146,7 +146,7 @@ docker run -d --name tapnow-online \
    - `TAPNOW_DEFAULT_ADMIN_USER`
    - `TAPNOW_DEFAULT_ADMIN_PASSWORD`
 2. 首次部署会按上述账号自动创建管理员。
-3. 对外分享或公网部署前，务必修改默认密码，避免使用 `admin/admin123`。
+3. 对外分享或公网部署前，务必修改默认密码，避免使用任何弱口令（例如 `admin/123456`）。
 
 ### 环境变量
 
@@ -170,8 +170,8 @@ cp .env.example .env
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `MYSQL_ROOT_PASSWORD` | MySQL root 密码 | `rootpassword123` |
-| `TAPNOW_DB_PASSWORD` | MySQL 应用用户密码 | `tapnow123` |
+| `MYSQL_ROOT_PASSWORD` | MySQL root 密码 | `change-me-root-password` |
+| `TAPNOW_DB_PASSWORD` | MySQL 应用用户密码 | `change-me-db-password` |
 
 #### 可选配置
 
@@ -218,7 +218,7 @@ pip install -r requirements.txt
 # 使用本地或远程 MySQL
 export TAPNOW_DATABASE_URL="mysql+pymysql://user:password@localhost:3306/tapnow_db?charset=utf8mb4"
 export TAPNOW_DEFAULT_ADMIN_USER="admin"
-export TAPNOW_DEFAULT_ADMIN_PASSWORD="admin123"
+export TAPNOW_DEFAULT_ADMIN_PASSWORD="please-change-me"
 ```
 
 **3. 启动后端服务**（终端1）

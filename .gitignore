@@ -1,1 +1,22 @@
+# Runtime data / local config
 config/
+tapnow_data/
+mysql_data/
+localserver/data/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Secret/key materials
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Logs and temporary files
+*.log
+*.tmp

@@ -24,7 +24,7 @@ services:
       TAPNOW_ENABLE_LOG: "${TAPNOW_ENABLE_LOG:-true}"
       TAPNOW_STATIC_DIR: "${TAPNOW_STATIC_DIR:-/app/static}"
       TAPNOW_DEFAULT_ADMIN_USER: "${TAPNOW_DEFAULT_ADMIN_USER:-admin}"
-      TAPNOW_DEFAULT_ADMIN_PASSWORD: "${TAPNOW_DEFAULT_ADMIN_PASSWORD:-admin123}"
+      TAPNOW_DEFAULT_ADMIN_PASSWORD: "${TAPNOW_DEFAULT_ADMIN_PASSWORD:-please-change-me}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/ping')"]
