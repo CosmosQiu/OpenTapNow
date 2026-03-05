@@ -3,8 +3,8 @@ import react from '@vitejs/plugin-react'
 import { viteSingleFile } from 'vite-plugin-singlefile'
 
 // https://vitejs.dev/config/
-export default defineConfig({
-  plugins: [react(), viteSingleFile()],
+export default defineConfig(({ command }) => ({
+  plugins: command === 'build' ? [react(), viteSingleFile()] : [react()],
   server: {
     host: '0.0.0.0',
     port: 5173,
@@ -19,4 +19,4 @@ export default defineConfig({
     cssCodeSplit: false, // Ensure CSS is inlined
     assetsInlineLimit: 100000000, // Large limit to ensure assets are inlined
   }
-})
+}))
