@@ -117,6 +117,23 @@ const getStoredLocalServerUrl = () => {
     }
 };
 
+const CONFIG_CACHE_SCHEMA_KEY = 'tapnow_config_schema_version';
+const CONFIG_CACHE_SCHEMA_VERSION = '2026-03-05-v1';
+const CONFIG_CACHE_KEYS = [
+    'tapnow_api_configs',
+    'tapnow_providers',
+    'tapnow_global_key',
+    'tapnow_model_library',
+    'tapnow_model_library_collapsed'
+];
+const isConfigCacheSchemaCurrent = () => {
+    try {
+        return localStorage.getItem(CONFIG_CACHE_SCHEMA_KEY) === CONFIG_CACHE_SCHEMA_VERSION;
+    } catch {
+        return true;
+    }
+};
+
 const t = i18n.t.bind(i18n);
 
 
@@ -2122,6 +2139,15 @@ const materializeStoryboardOutputFromSnapshot = (snapshot, currentShot) => {
 const isStoryboardDebugEnabled = () => {
     try {
         return localStorage.getItem('tapnow_debug_storyboard') === '1';
+    } catch (e) {
+        return false;
+    }
+};
+const isApiDebugEnabled = () => {
+    try {
+        const globalDebug = localStorage.getItem('tapnow_debug');
+        const apiDebug = localStorage.getItem('tapnow_debug_api');
+        return globalDebug === '1' || globalDebug === 'true' || apiDebug === '1' || apiDebug === 'true';
     } catch (e) {
         return false;
     }
@@ -6044,7 +6070,7 @@ function TapnowApp() {
     };
 
     const [modelLibrary, setModelLibrary] = useState(() => {
-        const saved = localStorage.getItem('tapnow_model_library');
+        const saved = isConfigCacheSchemaCurrent() ? localStorage.getItem('tapnow_model_library') : null;
         if (saved) {
             try {
                 const parsed = JSON.parse(saved);
@@ -6166,7 +6192,7 @@ function TapnowApp() {
     }, [getNativeMultiImageCapabilityKey]);
 
     const [apiConfigs, setApiConfigs] = useState(() => {
-        const saved = localStorage.getItem('tapnow_api_configs');
+        const saved = isConfigCacheSchemaCurrent() ? localStorage.getItem('tapnow_api_configs') : null;
 
         // V3.6.0: 如果有存量数据，直接使用（不再合并默认模型）
         if (saved) {
@@ -6184,8 +6210,7 @@ function TapnowApp() {
                         displayName: config.displayName || config.modelName || config.id,
                         ...(config.durations ? { durations: config.durations } : {})
                     };
-                    const { key, url, isCustom, ...rest } = normalized;
-                    return rest;
+                    return normalized;
                 });
 
                 // 过滤掉已删除的模型配置
@@ -6221,7 +6246,7 @@ function TapnowApp() {
     // V3.4.18: 使用 _deleted 标记追踪删除的Provider
     const [providers, setProviders] = useState(() => {
         try {
-            const saved = localStorage.getItem('tapnow_providers');
+            const saved = isConfigCacheSchemaCurrent() ? localStorage.getItem('tapnow_providers') : null;
             if (saved) {
                 const parsed = JSON.parse(saved);
                 // 直接使用用户保存的数据，不再自动补充默认Provider
@@ -6258,7 +6283,41 @@ function TapnowApp() {
         };
     }, [apiConfigs, providers]);
 
-    const [globalApiKey, setGlobalApiKey] = useState(() => localStorage.getItem('tapnow_global_key') || '');
+    const [globalApiKey, setGlobalApiKey] = useState(() => {
+        try {
+            if (!isConfigCacheSchemaCurrent()) return '';
+            return localStorage.getItem('tapnow_global_key') || '';
+        } catch {
+            return '';
+        }
+    });
+
+    useEffect(() => {
+        try {
+            const current = localStorage.getItem(CONFIG_CACHE_SCHEMA_KEY);
+            if (current === CONFIG_CACHE_SCHEMA_VERSION) return;
+
+            CONFIG_CACHE_KEYS.forEach((key) => localStorage.removeItem(key));
+            localStorage.setItem(CONFIG_CACHE_SCHEMA_KEY, CONFIG_CACHE_SCHEMA_VERSION);
+
+            setGlobalApiKey('');
+            setProviders(
+                Object.fromEntries(
+                    Object.entries(DEFAULT_PROVIDERS).map(([key, cfg]) => [key, normalizeProviderConfig(key, cfg)])
+                )
+            );
+            setApiConfigs(
+                DEFAULT_API_CONFIGS.map((c) => ({
+                    ...c,
+                    _uid: `uid-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+                }))
+            );
+            setModelLibrary(DEFAULT_MODEL_LIBRARY.map((entry) => ({ ...entry })));
+            setCollapsedLibraryModels(new Set());
+        } catch (e) {
+            console.warn('配置缓存版本迁移失败:', e);
+        }
+    }, []);
 
     // API 黑名单机制 (比照 Jimeng-api-tool 实现)
     const [apiBlacklist, setApiBlacklist] = useState(() => {
@@ -7186,7 +7245,7 @@ function TapnowApp() {
     const [previewContextMenu, setPreviewContextMenu] = useState({ visible: false, x: 0, y: 0, item: null });
     const [inputImageContextMenu, setInputImageContextMenu] = useState({ visible: false, x: 0, y: 0, nodeId: null });
     const [settingsOpen, setSettingsOpen] = useState(false);
-    const [settingsTab, setSettingsTab] = useState('providers');
+    const [selectedProviderKey, setSelectedProviderKey] = useState('');
     const [editingApiModels, setEditingApiModels] = useState(() => new Set());
     const [editingLibraryModels, setEditingLibraryModels] = useState(() => new Set());
     const [libraryPreviewModels, setLibraryPreviewModels] = useState(() => new Set());
@@ -7198,6 +7257,11 @@ function TapnowApp() {
     const [libraryTransportOptionsDrafts, setLibraryTransportOptionsDrafts] = useState(() => ({}));
     const [libraryAsyncConfigDrafts, setLibraryAsyncConfigDrafts] = useState(() => ({}));
     const [libraryRequestChainDrafts, setLibraryRequestChainDrafts] = useState(() => ({}));
+    const [apiRequestTemplateDrafts, setApiRequestTemplateDrafts] = useState(() => ({}));
+    const [apiTransportOptionsDrafts, setApiTransportOptionsDrafts] = useState(() => ({}));
+    const [apiAsyncConfigDrafts, setApiAsyncConfigDrafts] = useState(() => ({}));
+    const [apiRequestChainDrafts, setApiRequestChainDrafts] = useState(() => ({}));
+    const [apiCustomParamsDrafts, setApiCustomParamsDrafts] = useState(() => ({}));
     const [libraryAsyncPreviewModels, setLibraryAsyncPreviewModels] = useState(() => new Set());
     const [libraryNotesCollapsed, setLibraryNotesCollapsed] = useState(() => ({}));
     const [librarySectionCollapsed, setLibrarySectionCollapsed] = useState(() => ({}));
@@ -7232,7 +7296,7 @@ function TapnowApp() {
     const [activeTool, setActiveTool] = useState('select');
     const [activeDropdown, setActiveDropdown] = useState(null);
     const [hoveredProvider, setHoveredProvider] = useState(null); // V3.4.6: Provider 二级菜单状态
-    const [expandedProviders, setExpandedProviders] = useState({}); // V3.4.7: Settings Modal Provider 展开状态
+    const [expandedApiModels, setExpandedApiModels] = useState(() => new Set());
     const [editingProvider, setEditingProvider] = useState(null); // V3.4.7: Settings Modal Provider 编辑状态
     const [deletingProviderKey, setDeletingProviderKey] = useState(null); // V3.4.7: Settings Modal Provider 删除确认状态
     const [apiTesting, setApiTesting] = useState(null);
@@ -9946,7 +10010,7 @@ function TapnowApp() {
         });
     }, [apiConfigs.length, resolveModelKey, setNodes]);
 
-    // V3.4.19: 统一获取 API 凭据 - 只从 Provider 获取，不再从 Model 获取
+    // V3.4.19+: 统一获取 API 凭据，允许模型级覆盖供应商配置
     const getApiCredentials = useCallback((modelId) => {
         const config = getApiConfigByKey(modelId);
         if (!config) {
@@ -9961,11 +10025,14 @@ function TapnowApp() {
             };
         }
 
-        // V3.4.19: 只从 Provider 获取凭据，不再使用 model 级别的 key/url
         const provider = providers[config.provider];
-        // 如果Provider没有key，使用全局key作为最后fallback
-        const key = provider?.key || globalApiKey;
-        const url = (provider?.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
+        const modelKey = typeof config.key === 'string' ? config.key.trim() : '';
+        const modelUrl = typeof config.url === 'string' ? config.url.trim() : '';
+        // 如果Provider没有key，使用全局key作为最后fallback；模型级覆盖优先
+        const key = modelKey || provider?.key || globalApiKey;
+        const url = (modelUrl || provider?.url || DEFAULT_BASE_URL).replace(/\/+$/, '');
+        const useProxy = typeof config.useProxy === 'boolean' ? config.useProxy : !!provider?.useProxy;
+        const forceAsync = typeof config.forceAsync === 'boolean' ? config.forceAsync : !!provider?.forceAsync;
 
         return {
             key,
@@ -9975,8 +10042,8 @@ function TapnowApp() {
             provider: config.provider,
             type: config.type,
             apiType: config.apiType || provider?.apiType || 'openai',
-            useProxy: !!provider?.useProxy,
-            forceAsync: !!provider?.forceAsync
+            useProxy,
+            forceAsync
         };
     }, [getApiConfigByKey, providers, globalApiKey]);
 
@@ -10252,6 +10319,40 @@ function TapnowApp() {
         });
         return groups;
     }, [apiConfigs, providers, resolveApiConfig]);
+
+    useEffect(() => {
+        const providerKeys = Object.keys(groupedApiConfigs);
+        if (providerKeys.length === 0) {
+            if (selectedProviderKey) setSelectedProviderKey('');
+            return;
+        }
+        if (!selectedProviderKey || !groupedApiConfigs[selectedProviderKey]) {
+            setSelectedProviderKey(providerKeys[0]);
+        }
+    }, [groupedApiConfigs, selectedProviderKey]);
+
+    const selectedProviderGroup = groupedApiConfigs[selectedProviderKey] || null;
+    const selectedProviderModels = selectedProviderGroup?.models || [];
+    const providerScopedLibraryEntries = useMemo(() => {
+        if (!selectedProviderGroup) return [];
+        const providerModelIds = new Set(
+            selectedProviderModels
+                .map((model) => String(model.id || '').trim())
+                .filter(Boolean)
+        );
+        const providerLibraryIds = new Set(
+            selectedProviderModels
+                .map((model) => String(model.libraryId || '').trim())
+                .filter(Boolean)
+        );
+        return modelLibrary.filter((entry) => {
+            const entryId = String(entry?.id || '').trim();
+            const entryModelName = String(entry?.modelName || '').trim();
+            if (!entryId && !entryModelName) return false;
+            return providerLibraryIds.has(entryId) || providerModelIds.has(entryModelName) || providerModelIds.has(entryId);
+        });
+    }, [modelLibrary, selectedProviderGroup, selectedProviderModels]);
+    const hasExpandedScopedLibraryModels = providerScopedLibraryEntries.some((entry) => !collapsedLibraryModels.has(entry.id));
 
     const getFirstEnabledModelKey = useCallback((mode = 'image') => {
         const storageKey = mode === 'image' ? 'tapnow_last_image_model' : 'tapnow_last_video_model';
@@ -12555,32 +12656,127 @@ function TapnowApp() {
             next.delete(uid);
             return next;
         });
+        setExpandedApiModels(prev => {
+            const next = new Set(prev);
+            next.delete(uid);
+            return next;
+        });
+        setApiRequestTemplateDrafts(prev => {
+            const { [uid]: _removed, ...rest } = prev;
+            return rest;
+        });
+        setApiTransportOptionsDrafts(prev => {
+            const { [uid]: _removed, ...rest } = prev;
+            return rest;
+        });
+        setApiAsyncConfigDrafts(prev => {
+            const { [uid]: _removed, ...rest } = prev;
+            return rest;
+        });
+        setApiRequestChainDrafts(prev => {
+            const { [uid]: _removed, ...rest } = prev;
+            return rest;
+        });
+        setApiCustomParamsDrafts(prev => {
+            const { [uid]: _removed, ...rest } = prev;
+            return rest;
+        });
     };
 
     const testApiConnection = async (modelKey) => {
         const config = getApiConfigByKey(modelKey);
         const statusKey = config?._uid || modelKey;
+        const modelLabel = config?.displayName || config?.modelName || config?.id || modelKey;
         setApiTesting(statusKey);
         setApiStatus((prev) => ({ ...prev, [statusKey]: 'idle' }));
 
         // V3.4.8: 使用 getApiCredentials 获取 Provider 配置
         const { key: apiKey, url: baseUrl } = getApiCredentials(modelKey);
+        const requestUrl = `${baseUrl}/v1/models`;
+        const debugEnabled = isApiDebugEnabled();
+        const startedAt = (typeof performance !== 'undefined' && performance.now)
+            ? performance.now()
+            : Date.now();
+        const maskedApiKey = apiKey
+            ? (apiKey.length > 8 ? `${apiKey.slice(0, 4)}***${apiKey.slice(-4)}` : `${apiKey.slice(0, 1)}***`)
+            : '';
 
         if (!apiKey) {
             setApiStatus((prev) => ({ ...prev, [statusKey]: 'error' }));
+            showToast(t('连接测试失败：缺少 API Key'), 'error', 2200);
+            if (debugEnabled) {
+                console.error('[API Test] Missing API key', { modelKey, modelLabel, baseUrl });
+            }
             setApiTesting(null);
             return;
         }
 
         try {
-            const response = await fetch(`${baseUrl}/v1/models`, {
+            const response = await fetch(requestUrl, {
                 method: 'GET',
                 headers: { Authorization: `Bearer ${apiKey}` },
             });
-            if (response.ok) setApiStatus((prev) => ({ ...prev, [statusKey]: 'success' }));
-            else setApiStatus((prev) => ({ ...prev, [statusKey]: 'error' }));
-        } catch {
+            const responseText = await response.text();
+            let responseJson = null;
+            if (responseText) {
+                try {
+                    responseJson = JSON.parse(responseText);
+                } catch {
+                    responseJson = null;
+                }
+            }
+            const endedAt = (typeof performance !== 'undefined' && performance.now)
+                ? performance.now()
+                : Date.now();
+            const latencyMs = Math.max(0, Math.round(endedAt - startedAt));
+
+            if (debugEnabled) {
+                console.groupCollapsed(`[API Test] ${modelLabel} · ${response.status} · ${latencyMs}ms`);
+                console.log('request', {
+                    modelKey,
+                    modelLabel,
+                    provider: config?.provider,
+                    endpoint: requestUrl,
+                    apiKey: maskedApiKey
+                });
+                console.log('response', {
+                    ok: response.ok,
+                    status: response.status,
+                    statusText: response.statusText,
+                    json: responseJson,
+                    text: responseText
+                });
+                console.groupEnd();
+            }
+
+            if (response.ok) {
+                setApiStatus((prev) => ({ ...prev, [statusKey]: 'success' }));
+                showToast(`${t('连接测试成功')} · ${latencyMs}ms`, 'success', 2200);
+            } else {
+                setApiStatus((prev) => ({ ...prev, [statusKey]: 'error' }));
+                const message = responseJson?.error?.message
+                    || responseJson?.message
+                    || responseText
+                    || `HTTP ${response.status}`;
+                showToast(`${t('连接测试失败')}: ${String(message).slice(0, 140)}`, 'error', 2600);
+            }
+        } catch (error) {
             setApiStatus((prev) => ({ ...prev, [statusKey]: 'error' }));
+            const endedAt = (typeof performance !== 'undefined' && performance.now)
+                ? performance.now()
+                : Date.now();
+            const latencyMs = Math.max(0, Math.round(endedAt - startedAt));
+            if (debugEnabled) {
+                console.error('[API Test] Request failed', {
+                    modelKey,
+                    modelLabel,
+                    endpoint: requestUrl,
+                    apiKey: maskedApiKey,
+                    latencyMs,
+                    error
+                });
+            }
+            showToast(`${t('连接测试失败')}: ${error?.message || 'network error'}`, 'error', 2600);
         }
         setApiTesting(null);
     };
@@ -37582,51 +37778,46 @@ ${inputText.substring(0, 15000)} ... (截断)
                             }}
                         />
 
-                        <Modal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} title={t('模型接口配置')} theme={theme}>
-                            <div className="px-4 pt-3">
-                                <div className={`inline-flex rounded-md border ${theme === 'dark'
-                                    ? 'border-zinc-800 bg-[#18181b]'
+                        {settingsOpen && (
+                            <div className="fixed inset-0 z-[10000]">
+                                <div
+                                    className="absolute inset-0 bg-black/60"
+                                    onClick={() => setSettingsOpen(false)}
+                                />
+                                <div className={`absolute inset-3 md:inset-6 rounded-xl border shadow-2xl flex flex-col overflow-hidden ${theme === 'dark'
+                                    ? 'bg-zinc-950 border-zinc-800'
                                     : theme === 'solarized'
-                                        ? 'border-[#d7cfb2] bg-[#eee8d5]'
-                                        : 'border-zinc-200 bg-zinc-50'
-                                    } p-1`}>
-                                    <button
-                                        onClick={() => setSettingsTab('providers')}
-                                        className={`px-3 py-1 text-xs rounded ${settingsTab === 'providers'
-                                            ? theme === 'dark'
-                                                ? 'bg-zinc-800 text-zinc-100'
+                                        ? 'bg-[#fdf6e3] border-[#d7cfb2]'
+                                        : 'bg-white border-zinc-200'
+                                    }`}>
+                                    <div className={`px-4 py-3 border-b flex items-center justify-between ${theme === 'dark'
+                                        ? 'border-zinc-800'
+                                        : theme === 'solarized'
+                                            ? 'border-[#d7cfb2]'
+                                            : 'border-zinc-200'
+                                        }`}>
+                                        <h2 className={`text-sm font-semibold ${theme === 'dark' ? 'text-zinc-100' : 'text-zinc-800'}`}>{t('模型接口配置')}</h2>
+                                        <button
+                                            onClick={() => setSettingsOpen(false)}
+                                            className={`p-1.5 rounded transition-colors ${theme === 'dark'
+                                                ? 'text-zinc-300 hover:bg-zinc-800'
                                                 : theme === 'solarized'
-                                                    ? 'bg-[#fdf6e3] text-zinc-800'
-                                                    : 'bg-white text-zinc-800'
-                                            : theme === 'dark'
-                                                ? 'text-zinc-400 hover:text-zinc-200'
-                                                : theme === 'solarized'
-                                                    ? 'text-[#586e75] hover:text-zinc-800'
-                                                    : 'text-zinc-500 hover:text-zinc-700'
-                                            }`}
-                                    >
-                                        {t('接口配置')}
-                                    </button>
-                                    <button
-                                        onClick={() => setSettingsTab('library')}
-                                        className={`px-3 py-1 text-xs rounded ${settingsTab === 'library'
-                                            ? theme === 'dark'
-                                                ? 'bg-zinc-800 text-zinc-100'
-                                                : theme === 'solarized'
-                                                    ? 'bg-[#fdf6e3] text-zinc-800'
-                                                    : 'bg-white text-zinc-800'
-                                            : theme === 'dark'
-                                                ? 'text-zinc-400 hover:text-zinc-200'
-                                                : theme === 'solarized'
-                                                    ? 'text-[#586e75] hover:text-zinc-800'
-                                                    : 'text-zinc-500 hover:text-zinc-700'
-                                            }`}
-                                    >
-                                        {t('模型库')}
-                                    </button>
-                                </div>
-                            </div>
-                            {settingsTab === 'providers' && (
+                                                    ? 'text-zinc-700 hover:bg-[#eee8d5]'
+                                                    : 'text-zinc-600 hover:bg-zinc-100'
+                                                }`}
+                                            title={t('关闭')}
+                                        >
+                                            <X size={16} />
+                                        </button>
+                                    </div>
+                                    <div className="flex-1 min-h-0 flex flex-col lg:flex-row">
+                            <div className={`lg:w-[34%] overflow-y-auto custom-scrollbar border-b ${theme === 'dark'
+                                ? 'border-zinc-800 lg:border-r'
+                                : theme === 'solarized'
+                                    ? 'border-[#d7cfb2] lg:border-r'
+                                    : 'border-zinc-200 lg:border-r'
+                                }`}>
+                            {(
                                 <>
                                     <details className={`mx-4 mt-3 rounded-md border ${theme === 'dark'
                                         ? 'border-zinc-800 bg-[#18181b]'
@@ -37854,8 +38045,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             providers,
                                                             modelLibrary,
                                                             modelLibraryCollapsed: Array.from(collapsedLibraryModels),
-                                                            // V3.4.23: 导出时移除模型级别的 key/url，只保留纯净的配置
-                                                            apiConfigs: apiConfigs.map(({ key, url, ...c }) => c),
+                                                            apiConfigs,
                                                         };
                                                         const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
                                                         const url = URL.createObjectURL(blob);
@@ -37929,8 +38119,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                                             _uid: config._uid || `uid-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
                                                                             ...(config.durations ? { durations: config.durations } : {})
                                                                         };
-                                                                        const { key, url, isCustom, ...rest } = normalized;
-                                                                        return rest;
+                                                                        return normalized;
                                                                     });
                                                                     // 直接替换，不合并
                                                                     setApiConfigs(migratedConfigs);
@@ -38011,403 +38200,717 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             ? 'border-[#d7cfb2] bg-[#eee8d5]'
                                             : 'border-zinc-200 bg-white'
                                         }`}>
-                                        <div className={`px-3 py-2 text-xs font-medium ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}>
-                                            {t('接口与模型列表')}
+                                        <div className={`px-3 py-2 border-b flex items-center justify-between ${theme === 'dark' ? 'border-zinc-800 text-zinc-300' : 'border-zinc-200 text-zinc-700'}`}>
+                                            <span className="text-xs font-medium">{t('供应商')}</span>
+                                            <Button className="h-7 text-xs px-2 bg-blue-600 hover:bg-blue-500" onClick={() => {
+                                                const newKey = `custom-${Date.now()}`;
+                                                const newName = 'New Provider';
+                                                setProviders(prev => ({ ...prev, [newKey]: normalizeProviderConfig(newKey, { key: '', url: '', enabled: true }) }));
+                                                setEditingProvider({ key: newKey, tempName: newName });
+                                                setSelectedProviderKey(newKey);
+                                            }}>
+                                                <Plus size={12} className="mr-1" /> {t('添加')}
+                                            </Button>
                                         </div>
-                                        <div className="px-3 pb-3 pt-2">
-                            <div className="flex justify-between items-center mb-2">
-                                <span className={`text-xs ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-500'}`}>{t('管理您的第三方模型接口。')}</span>
-                                <div className="flex items-center gap-2">
-                                    <button
-                                        onClick={() => {
-                                            // Toggle all: if any expanded, collapse all; otherwise expand all
-                                            const hasExpanded = Object.values(expandedProviders).some(v => v);
-                                            const newExpanded = {};
-                                            if (!hasExpanded) {
-                                                Object.keys(groupedApiConfigs).forEach(key => newExpanded[key] = true);
-                                            }
-                                            setExpandedProviders(newExpanded);
-                                        }}
-                                        className={`p-1 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-500'}`}
-                                        title={Object.values(expandedProviders).some(v => v) ? "折叠所有" : "展开所有"}
-                                    >
-                                        <ChevronsUp size={14} className={`transition-transform ${!Object.values(expandedProviders).some(v => v) ? 'rotate-180' : ''}`} />
-                                    </button>
-                                    <Button className="h-7 text-xs px-3 bg-blue-600 hover:bg-blue-500" onClick={() => {
-                                        // V3.4.7: 添加供应商 - 自动创建并进入编辑模式
-                                        const newKey = `custom-${Date.now()}`;
-                                        const newName = 'New Provider';
-                                        setProviders(prev => ({ ...prev, [newKey]: normalizeProviderConfig(newKey, { key: '', url: '', enabled: true }) }));
-                                        setExpandedProviders(prev => ({ ...prev, [newKey]: true }));
-                                        setEditingProvider({ key: newKey, tempName: newName });
-                                    }}><Plus size={14} className="mr-1" /> {t('添加供应商')}</Button>
-                                </div>
-                            </div>
-                                    <div className="space-y-2 max-h-[50vh] overflow-y-auto custom-scrollbar pr-1">
-                                        {/* V3.4.7: 按 Provider 分组显示模型 */}
-                                        {Object.entries(groupedApiConfigs).map(([providerKey, group]) => (
-                                            <div key={providerKey} className={`group rounded-lg border ${theme === 'dark'
-                                                ? 'bg-[#18181b] border-zinc-800'
-                                                : theme === 'solarized'
-                                                    ? 'bg-[#fdf6e3] border-[#d7cfb2]'
-                                                    : theme === 'solarized' ? 'bg-[#fdf6e3] border-[#eee8d5]' : 'bg-zinc-50 border-zinc-200'
-                                                }`}>
-                                        {/* Provider 标题行 (可折叠) */}
-                                        <button
-                                            onClick={() => setExpandedProviders(prev => ({ ...prev, [providerKey]: !prev[providerKey] }))}
-                                            className={`w-full flex items-center justify-between px-3 py-2.5 text-left transition-colors ${theme === 'dark'
-                                                ? 'hover:bg-zinc-800/50'
-                                                : theme === 'solarized'
-                                                    ? 'hover:bg-[#eee8d5]'
-                                                    : 'hover:bg-zinc-100'
-                                                }`}
-                                        >
-                                            {deletingProviderKey === providerKey ? (
-                                                <div className="flex items-center justify-between w-full">
-                                                    <span className={`text-sm font-semibold ${theme === 'dark' ? 'text-zinc-100' : 'text-zinc-800'}`}>
-                                                        确定删除 {group.name}?
-                                                    </span>
-                                                    <div className="flex items-center gap-2">
-                                                        <button
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                // Delete provider
-                                                                setProviders(prev => {
-                                                                    const next = { ...prev };
-                                                                    delete next[providerKey];
-                                                                    return next;
-                                                                });
-                                                                setDeletingProviderKey(null);
-                                                            }}
-                                                            className="text-xs px-2 py-1 bg-red-600 hover:bg-red-700 text-white rounded"
-                                                        >
-                                                            {t('删除')}
-                                                        </button>
-                                                        <button
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                setDeletingProviderKey(null);
-                                                            }}
-                                                            className={`text-xs px-2 py-1 rounded ${theme === 'dark' ? 'bg-zinc-700 hover:bg-zinc-600 text-zinc-300' : 'bg-zinc-200 hover:bg-zinc-300 text-zinc-700'}`}
-                                                        >
-                                                            {t('取消')}
-                                                        </button>
-                                                    </div>
-                                                </div>
-                                            ) : (
-                                                <>
-                                                    <div className="flex items-center gap-2 flex-1">
-                                                        <div className={`w-2 h-2 rounded-full ${providers[providerKey]?.enabled !== false ? 'bg-green-500' : 'bg-zinc-500'}`}></div>
-                                                        {editingProvider?.key === providerKey ? (
-                                                            <input
-                                                                type="text"
-                                                                value={editingProvider.tempName}
-                                                                onChange={(e) => setEditingProvider(prev => ({ ...prev, tempName: e.target.value }))}
-                                                                onBlur={() => {
-                                                                    const newKey = editingProvider.tempName.trim();
-                                                                    const oldKey = providerKey;
-                                                                    if (newKey && newKey !== oldKey) {
-                                                                        // V3.6.0: 重命名 provider key（不用 name 字段）
-                                                                        setProviders(prev => {
-                                                                            const { [oldKey]: oldConfig, ...rest } = prev;
-                                                                            return { ...rest, [newKey]: oldConfig };
-                                                                        });
-                                                                        // 同步更新所有引用该 provider 的模型
-                                                                        setApiConfigs(prev => prev.map(c =>
-                                                                            c.provider === oldKey ? { ...c, provider: newKey } : c
-                                                                        ));
-                                                                    }
-                                                                    setEditingProvider(null);
-                                                                }}
-                                                                onKeyDown={(e) => {
-                                                                    if (e.key === 'Enter') {
-                                                                        e.target.blur();
-                                                                    }
-                                                                    e.stopPropagation();
-                                                                }}
-                                                                onClick={(e) => e.stopPropagation()}
-                                                                autoFocus
-                                                                className={`text-sm font-semibold bg-transparent border-b border-blue-500 outline-none w-full ${theme === 'dark' ? 'text-zinc-100' : 'text-zinc-800'}`}
-                                                            />
-                                                        ) : (
-                                                            <span className={`text-sm font-semibold ${theme === 'dark' ? 'text-zinc-100' : 'text-zinc-800'}`}>{group.name}</span>
-                                                        )}
-                                                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${theme === 'dark'
-                                                            ? 'bg-zinc-800 text-zinc-500'
-                                                            : theme === 'solarized'
-                                                                ? 'bg-[#eee8d5] text-zinc-600'
-                                                                : 'bg-zinc-200 text-zinc-500'}`}>
-                                                            {group.models.length} 模型
-                                                        </span>
-                                                    </div>
-                                                    <div className="flex items-center gap-2">
-                                                        {!editingProvider && (
-                                                            <>
-                                                                <button
-                                                                    onClick={(e) => {
-                                                                        e.stopPropagation();
-                                                                        setEditingProvider({ key: providerKey, tempName: group.name });
-                                                                    }}
-                                                                    className={`p-1 rounded-full hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors opacity-0 group-hover:opacity-100`}
-                                                                    title={t('修改名称')}
-                                                                >
-                                                                    <Edit2 size={12} className={theme === 'dark' ? 'text-zinc-400' : 'text-zinc-500'} />
-                                                                </button>
-                                                                <button
-                                                                    onClick={(e) => {
-                                                                        e.stopPropagation();
-                                                                        setDeletingProviderKey(providerKey);
-                                                                    }}
-                                                                    className={`p-1 rounded-full hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors opacity-0 group-hover:opacity-100`}
-                                                                    title={t('删除供应商')}
-                                                                >
-                                                                    <Trash2 size={12} className={theme === 'dark' ? 'text-zinc-400 hover:text-red-400' : 'text-zinc-500 hover:text-red-500'} />
-                                                                </button>
-                                                            </>
-                                                        )}
-                                                        <ChevronDown size={16} className={`transition-transform ${expandedProviders[providerKey] ? 'rotate-180' : ''} ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-400'}`} />
-                                                    </div>
-                                                </>
+                                        <div className="px-2 py-2 space-y-1 max-h-[50vh] overflow-y-auto custom-scrollbar">
+                                            {Object.entries(groupedApiConfigs).length === 0 && (
+                                                <div className={`px-2 py-1.5 text-[11px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>{t('暂无供应商')}</div>
                                             )}
-                                        </button>
-
-                                        {/* Provider 展开内容 */}
-                                        {expandedProviders[providerKey] && (
-                                            <div className={`px-3 pb-3 border-t ${theme === 'dark' ? 'border-zinc-800' : 'border-zinc-200'}`}>
-                                                {/* Provider 级别设置 */}
-                                                <div className="pt-3 pb-2 space-y-2">
-                                                    <div className="grid grid-cols-4 items-center gap-2">
-                                                        <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('接口类型')}</label>
-                                                        <select
-                                                            value={providers[providerKey]?.apiType || 'openai'}
-                                                            onChange={(e) => setProviders(prev => ({ ...prev, [providerKey]: { ...prev[providerKey], apiType: e.target.value } }))}
-                                                            className={`col-span-3 w-full rounded px-2 py-1 text-xs outline-none focus:border-blue-600/50 border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
-                                                        >
-                                                            <option value="openai">OpenAI</option>
-                                                            <option value="gemini">Gemini</option>
-                                                            <option value="modelscope">ModelScope</option>
-                                                        </select>
-                                                    </div>
-                                                    <div className="grid grid-cols-4 items-center gap-2">
-                                                        <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('本地代理')}</label>
-                                                        <div className="col-span-3 flex items-center gap-2">
-                                                            <label className="relative inline-flex items-center cursor-pointer">
-                                                                <input
-                                                                    type="checkbox"
-                                                                    checked={!!providers[providerKey]?.useProxy}
-                                                                    onChange={(e) => setProviders(prev => ({ ...prev, [providerKey]: { ...prev[providerKey], useProxy: e.target.checked } }))}
-                                                                    className="sr-only peer"
-                                                                />
-                                                                <div className={`w-9 h-5 rounded-full peer peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-500/50 ${providers[providerKey]?.useProxy
-                                                                    ? 'bg-blue-600'
-                                                                    : theme === 'dark'
-                                                                        ? 'bg-zinc-700'
-                                                                        : 'bg-zinc-300'
-                                                                    } peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all`}></div>
-                                                            </label>
-                                                            <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>使用 {localServerUrl || DEFAULT_LOCAL_SERVER_URL}/proxy</span>
-                                                        </div>
-                                                    </div>
-                                                    <div className="grid grid-cols-4 items-center gap-2">
-                                                        <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('异步模式')}</label>
-                                                        <div className="col-span-3 flex items-center gap-2">
-                                                            <label className="relative inline-flex items-center cursor-pointer">
-                                                                <input
-                                                                    type="checkbox"
-                                                                    checked={!!providers[providerKey]?.forceAsync}
-                                                                    onChange={(e) => setProviders(prev => ({ ...prev, [providerKey]: { ...prev[providerKey], forceAsync: e.target.checked } }))}
-                                                                    className="sr-only peer"
-                                                                />
-                                                                <div className={`w-9 h-5 rounded-full peer peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-500/50 ${providers[providerKey]?.forceAsync
-                                                                    ? 'bg-blue-600'
-                                                                    : theme === 'dark'
-                                                                        ? 'bg-zinc-700'
-                                                                        : 'bg-zinc-300'
-                                                                    } peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all`}></div>
-                                                            </label>
-                                                            <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('ModelScope 建议开启')}</span>
-                                                        </div>
-                                                    </div>
-                                                    <div className="grid grid-cols-4 items-center gap-2">
-                                                        <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>API Key</label>
-                                                        <input
-                                                            type="password"
-                                                            value={providers[providerKey]?.key || ''}
-                                                            onChange={(e) => setProviders(prev => ({ ...prev, [providerKey]: { ...prev[providerKey], key: e.target.value } }))}
-                                                            className={`col-span-3 w-full rounded px-2 py-1 text-xs outline-none focus:border-blue-600/50 border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
-                                                            placeholder="sk-..."
-                                                        />
-                                                    </div>
-                                                    <div className="grid grid-cols-4 items-center gap-2">
-                                                        <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>Base URL</label>
-                                                        <input
-                                                            type="text"
-                                                            value={providers[providerKey]?.url || ''}
-                                                            onChange={(e) => setProviders(prev => ({ ...prev, [providerKey]: { ...prev[providerKey], url: e.target.value } }))}
-                                                            className={`col-span-3 w-full rounded px-2 py-1 text-xs outline-none focus:border-blue-600/50 border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
-                                                            placeholder="https://..."
-                                                        />
-                                                    </div>
-                                                </div>
-
-                                                {/* 该 Provider 下的模型列表 */}
-                                                <div className={`mt-2 pt-2 border-t ${theme === 'dark' ? 'border-zinc-800/50' : 'border-zinc-200'}`}>
-
-                                                    <div className="flex items-center justify-between mb-2">
-                                                        <div className={`text-[10px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('模型')}</div>
-                                                        <div className="flex items-center gap-2">
-                                                            <button
-                                                                onClick={() => importApiModelConfigs(providerKey)}
-                                                                className={`text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'}`}
-                                                            >
-                                                                <UploadCloud size={10} /> {t('导入模型')}
-                                                            </button>
-                                                            <button
-                                                                onClick={() => {
-                                                                    const newId = `${providerKey}-${Date.now()}`;
-                                                                    const uid = `uid-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-                                                                    setApiConfigs(prev => [...prev, {
-                                                                        id: newId,
-                                                                        provider: providerKey,
-                                                                        type: 'Chat',
-                                                                        _uid: uid
-                                                                    }]);
-                                                                    setApiModelEditing(uid, true);
-                                                                }}
-                                                                className={`text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'}`}
-                                                            >
-                                                                <Plus size={10} /> {t('添加模型')}
-                                                            </button>
-                                                        </div>
-                                                    </div>
-                                                    <div className="space-y-1.5">
-                                                        {group.models.map(api => {
-                                                            const isEditing = editingApiModels.has(api._uid);
-                                                            const libraryLabel = api.libraryId
-                                                                ? (modelLibraryMap.get(api.libraryId)?.displayName
-                                                                    || modelLibraryMap.get(api.libraryId)?.modelName
-                                                                    || api.libraryId)
-                                                                : '';
-                                                            const resolvedApiType = api.apiType || providers[providerKey]?.apiType || 'openai';
-                                                            const statusKey = api._uid || api.id;
-                                                            return (
-                                                                <div key={api._uid} className={`flex flex-col gap-2 px-2 py-2 rounded ${theme === 'dark'
-                                                                    ? 'bg-zinc-900/50 hover:bg-zinc-800/50'
-                                                                    : theme === 'solarized'
-                                                                        ? 'bg-[#fdf6e3] hover:bg-[#eee8d5]'
-                                                                        : 'bg-white hover:bg-zinc-100'
-                                                                    }`}>
-                                                                    <div className="flex items-start justify-between gap-2">
-                                                                        <div className="flex flex-wrap items-center gap-2 flex-1">
-                                                                            <div className={`w-1.5 h-1.5 rounded-full ${getStatusColor(api._uid)}`}></div>
-                                                                            <input
-                                                                                type="text"
-                                                                                value={api.id || ''}
-                                                                                onChange={(e) => updateApiConfig(api._uid, { id: e.target.value })}
-                                                                                onKeyDown={(e) => e.stopPropagation()}
-                                                                                onClick={(e) => e.stopPropagation()}
-                                                                                className={`text-xs bg-transparent border-b border-transparent hover:border-zinc-600 focus:border-blue-500 outline-none flex-1 min-w-[120px] font-mono ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}
-                                                                                placeholder="model-id"
-                                                                                title={`模型 ID: ${api.id}`}
-                                                                                disabled={!isEditing}
-                                                                            />
-                                                                            <select
-                                                                                value={api.type || 'Chat'}
-                                                                                onChange={(e) => updateApiConfig(api._uid, { type: e.target.value })}
-                                                                                className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
-                                                                                disabled={!isEditing || !!api.libraryId}
-                                                                            >
-                                                                                <option value="Chat">Chat</option>
-                                                                                <option value="Image">Image</option>
-                                                                                <option value="ChatImage">Chat Image</option>
-                                                                                <option value="Video">Video</option>
-                                                                            </select>
-                                                                            <select
-                                                                                value={api.libraryId || ''}
-                                                                                onChange={(e) => {
-                                                                                    const selectedId = e.target.value || null;
-                                                                                    const selected = selectedId ? modelLibraryMap.get(selectedId) : null;
-                                                                                    const updates = { libraryId: selectedId };
-                                                                                    if (selected) {
-                                                                                        updates.modelName = selected.modelName;
-                                                                                        updates.displayName = selected.displayName;
-                                                                                        updates.type = selected.type || api.type;
-                                                                                        updates.apiType = selected.apiType || api.apiType;
-                                                                                        updates.ratioLimits = Array.isArray(selected.ratioLimits) ? selected.ratioLimits : null;
-                                                                                        updates.resolutionLimits = Array.isArray(selected.resolutionLimits) ? selected.resolutionLimits : null;
-                                                                                        updates.durations = Array.isArray(selected.durations) ? selected.durations : null;
-                                                                                        updates.videoResolutions = Array.isArray(selected.videoResolutions) ? selected.videoResolutions : null;
-                                                                                    }
-                                                                                    updateApiConfig(api._uid, updates);
-                                                                                }}
-                                                                                className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none min-w-[120px] ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
-                                                                                disabled={!isEditing}
-                                                                            >
-                                                                                <option value="">{t('不引用模型库')}</option>
-                                                                                {modelLibrary.map((entry) => (
-                                                                                    <option key={entry.id} value={entry.id}>{entry.displayName || entry.modelName || entry.id}</option>
-                                                                                ))}
-                                                                            </select>
-                                                                            <select
-                                                                                value={api.apiType || ''}
-                                                                                onChange={(e) => updateApiConfig(api._uid, { apiType: e.target.value || null })}
-                                                                                className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
-                                                                                disabled={!isEditing || !!api.libraryId}
-                                                                            >
-                                                                                <option value="">{t('跟随 Provider')}</option>
-                                                                                <option value="openai">OpenAI</option>
-                                                                                <option value="gemini">Gemini</option>
-                                                                                <option value="modelscope">ModelScope</option>
-                                                                            </select>
-                                                                        </div>
-                                                                        <div className="flex items-center gap-1">
-                                                                            <button
-                                                                                onClick={() => exportApiModelConfig(api)}
-                                                                                className={`px-1.5 py-0.5 rounded text-[9px] ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
-                                                                                title={t('导出该模型')}
-                                                                            >
-                                                                                <Download size={10} />
-                                                                            </button>
-                                                                            <button
-                                                                                onClick={() => setApiModelEditing(api._uid, !isEditing)}
-                                                                                className={`px-1.5 py-0.5 rounded text-[9px] ${theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
-                                                                                title={isEditing ? t('完成编辑') : t('编辑')}
-                                                                            >
-                                                                                {isEditing ? <Check size={10} /> : <Pencil size={10} />}
-                                                                            </button>
-                                                                            <button
-                                                                                onClick={() => testApiConnection(statusKey)}
-                                                                                disabled={apiTesting === statusKey}
-                                                                                className={`px-1.5 py-0.5 rounded text-[9px] ${apiStatus[statusKey] === 'success' ? 'text-green-500' : theme === 'dark' ? 'text-zinc-500 hover:text-zinc-300' : 'text-zinc-400 hover:text-zinc-600'}`}
-                                                                            >
-                                                                                {apiTesting === statusKey ? <Loader2 size={10} className="animate-spin" /> : apiStatus[statusKey] === 'success' ? <CheckCircle2 size={10} /> : <LinkIcon size={10} />}
-                                                                            </button>
-                                                                            <button onClick={() => deleteApiConfig(api._uid)} className={`px-1 ${theme === 'dark' ? 'text-zinc-600 hover:text-red-500' : 'text-zinc-400 hover:text-red-500'}`}>
-                                                                                <Trash2 size={10} />
-                                                                            </button>
-                                                                        </div>
-                                                                    </div>
-                                                                    <div className={`flex flex-wrap items-center gap-2 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
-                                                                        <span>{t('模型库：')}{api.libraryId ? libraryLabel : t('未引用')}</span>
-                                                                        <span>{t('API模型：')}{api.modelName || api.id}</span>
-                                                                        <span>{t('接口：')}{resolvedApiType}</span>
-                                                                    </div>
-                                                                </div>
-                                                            );
-                                                        })}
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        )}
-                                    </div>
-                                ))}
-                            </div>
+                                            {Object.entries(groupedApiConfigs).map(([providerKey, group]) => {
+                                                const active = providerKey === selectedProviderKey;
+                                                return (
+                                                    <button
+                                                        key={providerKey}
+                                                        onClick={() => setSelectedProviderKey(providerKey)}
+                                                        className={`w-full px-2 py-1.5 rounded text-left flex items-center justify-between transition-colors ${active
+                                                            ? theme === 'dark'
+                                                                ? 'bg-zinc-800 text-zinc-100'
+                                                                : theme === 'solarized'
+                                                                    ? 'bg-[#fdf6e3] text-zinc-800 border border-[#d7cfb2]'
+                                                                    : 'bg-zinc-100 text-zinc-900 border border-zinc-300'
+                                                            : theme === 'dark'
+                                                                ? 'text-zinc-400 hover:bg-zinc-800/60'
+                                                                : theme === 'solarized'
+                                                                    ? 'text-zinc-700 hover:bg-[#fdf6e3]'
+                                                                    : 'text-zinc-600 hover:bg-zinc-100'
+                                                            }`}
+                                                    >
+                                                        <span className="flex items-center gap-2 min-w-0">
+                                                            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${providers[providerKey]?.enabled !== false ? 'bg-green-500' : 'bg-zinc-500'}`}></span>
+                                                            <span className="text-xs font-medium truncate">{group.name}</span>
+                                                        </span>
+                                                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${theme === 'dark' ? 'bg-zinc-900 text-zinc-500' : 'bg-zinc-200 text-zinc-500'}`}>
+                                                            {group.models.length}
+                                                        </span>
+                                                    </button>
+                                                );
+                                            })}
                                         </div>
                                     </div>
                                 </>
                             )}
 
-                            {settingsTab === 'library' && (
+                            </div>
+
+                            <div className="flex-1 overflow-y-auto custom-scrollbar">
+
+                            {selectedProviderGroup && (
+                                <div className={`rounded-md border p-3 ${theme === 'dark'
+                                    ? 'border-zinc-800 bg-[#18181b]'
+                                    : theme === 'solarized'
+                                        ? 'border-[#d7cfb2] bg-[#eee8d5]'
+                                        : 'border-zinc-200 bg-white'
+                                    }`}>
+                                    <div className="flex items-center justify-between gap-2 mb-3">
+                                        <div className="flex items-center gap-2 min-w-0">
+                                            <div className={`w-2 h-2 rounded-full ${providers[selectedProviderKey]?.enabled !== false ? 'bg-green-500' : 'bg-zinc-500'}`} />
+                                            {editingProvider?.key === selectedProviderKey ? (
+                                                <input
+                                                    type="text"
+                                                    value={editingProvider.tempName}
+                                                    onChange={(e) => setEditingProvider(prev => ({ ...prev, tempName: e.target.value }))}
+                                                    onBlur={() => {
+                                                        const oldKey = selectedProviderKey;
+                                                        const newKey = String(editingProvider.tempName || '').trim();
+                                                        if (newKey && newKey !== oldKey) {
+                                                            setProviders(prev => {
+                                                                const { [oldKey]: oldConfig, ...rest } = prev;
+                                                                return { ...rest, [newKey]: oldConfig };
+                                                            });
+                                                            setApiConfigs(prev => prev.map(c => c.provider === oldKey ? { ...c, provider: newKey } : c));
+                                                            setSelectedProviderKey(newKey);
+                                                        }
+                                                        setEditingProvider(null);
+                                                    }}
+                                                    onKeyDown={(e) => {
+                                                        if (e.key === 'Enter') e.currentTarget.blur();
+                                                        e.stopPropagation();
+                                                    }}
+                                                    className={`text-sm font-semibold bg-transparent border-b border-blue-500 outline-none min-w-[140px] ${theme === 'dark' ? 'text-zinc-100' : 'text-zinc-800'}`}
+                                                    autoFocus
+                                                />
+                                            ) : (
+                                                <div className={`text-sm font-semibold truncate ${theme === 'dark' ? 'text-zinc-100' : 'text-zinc-800'}`}>{selectedProviderGroup.name}</div>
+                                            )}
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                            {!editingProvider && deletingProviderKey !== selectedProviderKey && (
+                                                <button
+                                                    onClick={() => setEditingProvider({ key: selectedProviderKey, tempName: selectedProviderGroup.name })}
+                                                    className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800' : 'text-zinc-500 hover:text-zinc-700 hover:bg-zinc-200'}`}
+                                                    title={t('修改名称')}
+                                                >
+                                                    <Edit2 size={12} />
+                                                </button>
+                                            )}
+                                            {deletingProviderKey !== selectedProviderKey && (
+                                                <button
+                                                    onClick={() => setDeletingProviderKey(selectedProviderKey)}
+                                                    className={`p-1 rounded ${theme === 'dark' ? 'text-zinc-400 hover:text-red-400 hover:bg-zinc-800' : 'text-zinc-500 hover:text-red-500 hover:bg-zinc-200'}`}
+                                                    title={t('删除供应商')}
+                                                >
+                                                    <Trash2 size={12} />
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    {deletingProviderKey === selectedProviderKey ? (
+                                        <div className="mb-3 flex items-center justify-between rounded border border-red-500/30 bg-red-500/10 px-3 py-2">
+                                            <span className="text-xs text-red-500">{t('确定删除该供应商？')}</span>
+                                            <div className="flex items-center gap-2">
+                                                <button
+                                                    onClick={() => {
+                                                        const keyToDelete = selectedProviderKey;
+                                                        setProviders(prev => {
+                                                            const next = { ...prev };
+                                                            delete next[keyToDelete];
+                                                            return next;
+                                                        });
+                                                        setDeletingProviderKey(null);
+                                                    }}
+                                                    className="text-xs px-2 py-1 rounded bg-red-600 text-white hover:bg-red-700"
+                                                >
+                                                    {t('删除')}
+                                                </button>
+                                                <button
+                                                    onClick={() => setDeletingProviderKey(null)}
+                                                    className={`text-xs px-2 py-1 rounded ${theme === 'dark' ? 'bg-zinc-700 text-zinc-200' : 'bg-zinc-200 text-zinc-700'}`}
+                                                >
+                                                    {t('取消')}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ) : (
+                                        <>
+                                            <div className="space-y-2">
+                                                <div className="grid grid-cols-4 items-center gap-2">
+                                                    <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('接口类型')}</label>
+                                                    <select
+                                                        value={providers[selectedProviderKey]?.apiType || 'openai'}
+                                                        onChange={(e) => setProviders(prev => ({ ...prev, [selectedProviderKey]: { ...prev[selectedProviderKey], apiType: e.target.value } }))}
+                                                        className={`col-span-3 w-full rounded px-2 py-1 text-xs outline-none focus:border-blue-600/50 border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                    >
+                                                        <option value="openai">OpenAI</option>
+                                                        <option value="gemini">Gemini</option>
+                                                        <option value="modelscope">ModelScope</option>
+                                                    </select>
+                                                </div>
+                                                <div className="grid grid-cols-4 items-center gap-2">
+                                                    <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('本地代理')}</label>
+                                                    <div className="col-span-3 flex items-center gap-2">
+                                                        <label className="relative inline-flex items-center cursor-pointer">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={!!providers[selectedProviderKey]?.useProxy}
+                                                                onChange={(e) => setProviders(prev => ({ ...prev, [selectedProviderKey]: { ...prev[selectedProviderKey], useProxy: e.target.checked } }))}
+                                                                className="sr-only peer"
+                                                            />
+                                                            <div className={`w-9 h-5 rounded-full peer peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-500/50 ${providers[selectedProviderKey]?.useProxy
+                                                                ? 'bg-blue-600'
+                                                                : theme === 'dark'
+                                                                    ? 'bg-zinc-700'
+                                                                    : 'bg-zinc-300'
+                                                                } peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all`}></div>
+                                                        </label>
+                                                        <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>使用 {localServerUrl || DEFAULT_LOCAL_SERVER_URL}/proxy</span>
+                                                    </div>
+                                                </div>
+                                                <div className="grid grid-cols-4 items-center gap-2">
+                                                    <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('异步模式')}</label>
+                                                    <div className="col-span-3 flex items-center gap-2">
+                                                        <label className="relative inline-flex items-center cursor-pointer">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={!!providers[selectedProviderKey]?.forceAsync}
+                                                                onChange={(e) => setProviders(prev => ({ ...prev, [selectedProviderKey]: { ...prev[selectedProviderKey], forceAsync: e.target.checked } }))}
+                                                                className="sr-only peer"
+                                                            />
+                                                            <div className={`w-9 h-5 rounded-full peer peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-500/50 ${providers[selectedProviderKey]?.forceAsync
+                                                                ? 'bg-blue-600'
+                                                                : theme === 'dark'
+                                                                    ? 'bg-zinc-700'
+                                                                    : 'bg-zinc-300'
+                                                                } peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all`}></div>
+                                                        </label>
+                                                        <span className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('ModelScope 建议开启')}</span>
+                                                    </div>
+                                                </div>
+                                                <div className="grid grid-cols-4 items-center gap-2">
+                                                    <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>API Key</label>
+                                                    <input
+                                                        type="password"
+                                                        value={providers[selectedProviderKey]?.key || ''}
+                                                        onChange={(e) => setProviders(prev => ({ ...prev, [selectedProviderKey]: { ...prev[selectedProviderKey], key: e.target.value } }))}
+                                                        className={`col-span-3 w-full rounded px-2 py-1 text-xs outline-none focus:border-blue-600/50 border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                        placeholder="sk-..."
+                                                    />
+                                                </div>
+                                                <div className="grid grid-cols-4 items-center gap-2">
+                                                    <label className={`text-[10px] font-medium uppercase tracking-wider text-right ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>Base URL</label>
+                                                    <input
+                                                        type="text"
+                                                        value={providers[selectedProviderKey]?.url || ''}
+                                                        onChange={(e) => setProviders(prev => ({ ...prev, [selectedProviderKey]: { ...prev[selectedProviderKey], url: e.target.value } }))}
+                                                        className={`col-span-3 w-full rounded px-2 py-1 text-xs outline-none focus:border-blue-600/50 border ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                        placeholder="https://..."
+                                                    />
+                                                </div>
+                                            </div>
+
+                                            <div className={`mt-3 pt-3 border-t ${theme === 'dark' ? 'border-zinc-800/50' : 'border-zinc-200'}`}>
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <div className={`text-[10px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('模型')}</div>
+                                                    <div className="flex items-center gap-2">
+                                                        <button
+                                                            onClick={() => importApiModelConfigs(selectedProviderKey)}
+                                                            className={`text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'}`}
+                                                        >
+                                                            <UploadCloud size={10} /> {t('导入模型')}
+                                                        </button>
+                                                        <button
+                                                            onClick={() => {
+                                                                const newId = `${selectedProviderKey}-${Date.now()}`;
+                                                                const uid = `uid-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+                                                                setApiConfigs(prev => [...prev, {
+                                                                    id: newId,
+                                                                    provider: selectedProviderKey,
+                                                                    type: 'Chat',
+                                                                    _uid: uid
+                                                                }]);
+                                                                setApiModelEditing(uid, true);
+                                                            }}
+                                                            className={`text-[9px] px-1.5 py-0.5 rounded flex items-center gap-1 ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-600 hover:bg-zinc-300'}`}
+                                                        >
+                                                            <Plus size={10} /> {t('添加模型')}
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <div className="space-y-1.5">
+                                                    {selectedProviderModels.map(api => {
+                                                        const isEditing = editingApiModels.has(api._uid);
+                                                        const isExpanded = expandedApiModels.has(api._uid);
+                                                        const resolvedApiType = api.apiType || providers[selectedProviderKey]?.apiType || 'openai';
+                                                        const proxyModeValue = typeof api.useProxy === 'boolean' ? String(api.useProxy) : '';
+                                                        const asyncModeValue = typeof api.forceAsync === 'boolean' ? String(api.forceAsync) : '';
+                                                        const statusKey = api._uid || api.id;
+                                                        const requestTemplateValue = normalizeRequestTemplate(api.requestTemplate || getDefaultRequestTemplateForEntry(api));
+                                                        const transportModeValue = normalizeTransportMode(api.transport);
+                                                        const transportOptionsValue = normalizeTransportOptions(api.transportOptions);
+                                                        const capabilitiesValue = normalizeCapabilitySchema(api.capabilities, api.type);
+                                                        const asyncConfigValue = normalizeAsyncConfig(api.asyncConfig);
+                                                        const requestChainValue = normalizeRequestChain(api.requestChain);
+                                                        const customParamsValue = normalizeCustomParams(api.customParams);
+                                                        const requestTemplateDraft = apiRequestTemplateDrafts[api._uid] || {
+                                                            headers: JSON.stringify(requestTemplateValue?.headers || {}, null, 2),
+                                                            query: JSON.stringify(requestTemplateValue?.query || {}, null, 2),
+                                                            body: requestTemplateValue?.bodyType === 'raw'
+                                                                ? String(requestTemplateValue?.body ?? '')
+                                                                : JSON.stringify(requestTemplateValue?.body || {}, null, 2),
+                                                            files: JSON.stringify(requestTemplateValue?.files || {}, null, 2),
+                                                            timeoutMs: requestTemplateValue?.timeoutMs ?? ''
+                                                        };
+                                                        const transportOptionsDraft = apiTransportOptionsDrafts[api._uid] || JSON.stringify(transportOptionsValue, null, 2);
+                                                        const asyncConfigDraft = apiAsyncConfigDrafts[api._uid] || JSON.stringify(asyncConfigValue || buildEmptyAsyncConfig(), null, 2);
+                                                        const requestChainDraft = apiRequestChainDrafts[api._uid] || JSON.stringify(requestChainValue || REQUEST_CHAIN_TEMPLATE, null, 2);
+                                                        const customParamsDraft = apiCustomParamsDrafts[api._uid] || JSON.stringify(customParamsValue || [], null, 2);
+                                                        return (
+                                                            <div key={api._uid} className={`flex flex-col gap-2 px-2 py-2 rounded ${theme === 'dark'
+                                                                ? 'bg-zinc-900/50 hover:bg-zinc-800/50'
+                                                                : theme === 'solarized'
+                                                                    ? 'bg-[#fdf6e3] hover:bg-[#eee8d5]'
+                                                                    : 'bg-white hover:bg-zinc-100'
+                                                                }`}>
+                                                                <div className="flex items-start justify-between gap-2">
+                                                                    <div className="flex flex-wrap items-center gap-2 flex-1">
+                                                                        <div className={`w-1.5 h-1.5 rounded-full ${getStatusColor(api._uid)}`}></div>
+                                                                        <input
+                                                                            type="text"
+                                                                            value={api.id || ''}
+                                                                            onChange={(e) => updateApiConfig(api._uid, { id: e.target.value })}
+                                                                            onKeyDown={(e) => e.stopPropagation()}
+                                                                            onClick={(e) => e.stopPropagation()}
+                                                                            className={`text-xs bg-transparent border-b border-transparent hover:border-zinc-600 focus:border-blue-500 outline-none flex-1 min-w-[120px] font-mono ${theme === 'dark' ? 'text-zinc-300' : 'text-zinc-700'}`}
+                                                                            placeholder="model-id"
+                                                                            title={`模型 ID: ${api.id}`}
+                                                                            disabled={!isEditing}
+                                                                        />
+                                                                        <select
+                                                                            value={api.type || 'Chat'}
+                                                                            onChange={(e) => updateApiConfig(api._uid, { type: e.target.value, libraryId: null })}
+                                                                            className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
+                                                                            disabled={!isEditing}
+                                                                        >
+                                                                            <option value="Chat">Chat</option>
+                                                                            <option value="Image">Image</option>
+                                                                            <option value="ChatImage">Chat Image</option>
+                                                                            <option value="Video">Video</option>
+                                                                        </select>
+                                                                        <select
+                                                                            value={api.apiType || ''}
+                                                                            onChange={(e) => updateApiConfig(api._uid, { apiType: e.target.value || null, libraryId: null })}
+                                                                            className={`text-[9px] px-1 py-0.5 rounded cursor-pointer outline-none ${theme === 'dark' ? 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-500 hover:bg-zinc-300'}`}
+                                                                            disabled={!isEditing}
+                                                                        >
+                                                                            <option value="">{t('跟随 Provider')}</option>
+                                                                            <option value="openai">OpenAI</option>
+                                                                            <option value="gemini">Gemini</option>
+                                                                            <option value="modelscope">ModelScope</option>
+                                                                        </select>
+                                                                    </div>
+                                                                    <div className="flex items-center gap-1 flex-wrap justify-end">
+                                                                        <button
+                                                                            onClick={() => exportApiModelConfig(api)}
+                                                                            className={`px-2 py-1 rounded text-[10px] inline-flex items-center gap-1 border ${theme === 'dark' ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800' : 'border-zinc-300 text-zinc-600 hover:bg-zinc-100'}`}
+                                                                            title={t('导出该模型')}
+                                                                        >
+                                                                            <Download size={12} /> {t('导出')}
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => setApiModelEditing(api._uid, !isEditing)}
+                                                                            className={`px-2 py-1 rounded text-[10px] inline-flex items-center gap-1 border ${theme === 'dark' ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800' : 'border-zinc-300 text-zinc-600 hover:bg-zinc-100'}`}
+                                                                            title={isEditing ? t('完成编辑') : t('编辑')}
+                                                                        >
+                                                                            {isEditing ? <Check size={12} /> : <Pencil size={12} />} {isEditing ? t('完成') : t('编辑')}
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => testApiConnection(statusKey)}
+                                                                            disabled={apiTesting === statusKey}
+                                                                            className={`px-2 py-1 rounded text-[10px] inline-flex items-center gap-1 border ${apiStatus[statusKey] === 'success' ? 'text-green-500 border-green-500/40' : theme === 'dark' ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800' : 'border-zinc-300 text-zinc-600 hover:bg-zinc-100'}`}
+                                                                        >
+                                                                            {apiTesting === statusKey ? <Loader2 size={12} className="animate-spin" /> : apiStatus[statusKey] === 'success' ? <CheckCircle2 size={12} /> : <LinkIcon size={12} />} {t('测试连接')}
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => deleteApiConfig(api._uid)}
+                                                                            className={`px-2 py-1 rounded text-[10px] inline-flex items-center gap-1 border ${theme === 'dark' ? 'border-zinc-700 text-zinc-400 hover:text-red-400 hover:border-red-500/40 hover:bg-zinc-800' : 'border-zinc-300 text-zinc-500 hover:text-red-500 hover:bg-zinc-100'}`}
+                                                                        >
+                                                                            <Trash2 size={12} /> {t('删除')}
+                                                                        </button>
+                                                                        <button
+                                                                            onClick={() => setExpandedApiModels(prev => {
+                                                                                const next = new Set(prev);
+                                                                                if (next.has(api._uid)) next.delete(api._uid);
+                                                                                else next.add(api._uid);
+                                                                                return next;
+                                                                            })}
+                                                                            className={`px-2 py-1 rounded text-[10px] inline-flex items-center gap-1 border ${theme === 'dark' ? 'border-zinc-700 text-zinc-300 hover:bg-zinc-800' : 'border-zinc-300 text-zinc-600 hover:bg-zinc-100'}`}
+                                                                            title={isExpanded ? t('收起高级配置') : t('展开高级配置')}
+                                                                        >
+                                                                            <ChevronDown size={12} className={`transition-transform ${isExpanded ? 'rotate-180' : ''}`} /> {isExpanded ? t('收起高级') : t('高级配置')}
+                                                                        </button>
+                                                                    </div>
+                                                                </div>
+                                                                <div className={`flex flex-wrap items-center gap-2 text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>
+                                                                    <span>{t('API模型：')}{api.modelName || api.id}</span>
+                                                                    <span>{t('接口：')}{resolvedApiType}</span>
+                                                                    <span>{t('覆盖：')}{typeof api.key === 'string' && api.key.trim() ? 'Key ' : ''}{typeof api.url === 'string' && api.url.trim() ? 'URL ' : ''}{typeof api.useProxy === 'boolean' ? 'Proxy ' : ''}{typeof api.forceAsync === 'boolean' ? 'Async ' : ''}{(typeof api.key === 'string' && api.key.trim()) || (typeof api.url === 'string' && api.url.trim()) || typeof api.useProxy === 'boolean' || typeof api.forceAsync === 'boolean' ? '' : t('无')}</span>
+                                                                </div>
+                                                                {isExpanded && (
+                                                                    <div className={`mt-1 rounded border p-2 space-y-2 ${theme === 'dark' ? 'border-zinc-800 bg-zinc-950/50' : 'border-zinc-200 bg-zinc-50'}`}>
+                                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                                            <div className="space-y-1">
+                                                                                <label className={`text-[9px] uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('显示名')}</label>
+                                                                                <input
+                                                                                    type="text"
+                                                                                    value={api.displayName || ''}
+                                                                                    onChange={(e) => updateApiConfig(api._uid, { displayName: e.target.value, libraryId: null })}
+                                                                                    className={`w-full rounded px-2 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder={t('可选：用于界面展示')}
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                            </div>
+                                                                            <div className="space-y-1">
+                                                                                <label className={`text-[9px] uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('模型名(请求用)')}</label>
+                                                                                <input
+                                                                                    type="text"
+                                                                                    value={api.modelName || ''}
+                                                                                    onChange={(e) => updateApiConfig(api._uid, { modelName: e.target.value, libraryId: null })}
+                                                                                    className={`w-full rounded px-2 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder={t('留空则使用模型ID')}
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                                            <div className="space-y-1">
+                                                                                <label className={`text-[9px] uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>API Key {t('覆盖')}</label>
+                                                                                <input
+                                                                                    type="password"
+                                                                                    value={api.key || ''}
+                                                                                    onChange={(e) => updateApiConfig(api._uid, { key: e.target.value, libraryId: null })}
+                                                                                    className={`w-full rounded px-2 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder={t('留空=跟随供应商/全局')}
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                            </div>
+                                                                            <div className="space-y-1">
+                                                                                <label className={`text-[9px] uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>Base URL {t('覆盖')}</label>
+                                                                                <input
+                                                                                    type="text"
+                                                                                    value={api.url || ''}
+                                                                                    onChange={(e) => updateApiConfig(api._uid, { url: e.target.value, libraryId: null })}
+                                                                                    className={`w-full rounded px-2 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder={t('留空=跟随供应商')}
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                                            <div className="space-y-1">
+                                                                                <label className={`text-[9px] uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('本地代理覆盖')}</label>
+                                                                                <select
+                                                                                    value={proxyModeValue}
+                                                                                    onChange={(e) => {
+                                                                                        const value = e.target.value;
+                                                                                        updateApiConfig(api._uid, { useProxy: value === '' ? null : value === 'true', libraryId: null });
+                                                                                    }}
+                                                                                    className={`w-full rounded px-2 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    disabled={!isEditing}
+                                                                                >
+                                                                                    <option value="">{t('跟随供应商')}</option>
+                                                                                    <option value="true">{t('强制开启')}</option>
+                                                                                    <option value="false">{t('强制关闭')}</option>
+                                                                                </select>
+                                                                            </div>
+                                                                            <div className="space-y-1">
+                                                                                <label className={`text-[9px] uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('异步模式覆盖')}</label>
+                                                                                <select
+                                                                                    value={asyncModeValue}
+                                                                                    onChange={(e) => {
+                                                                                        const value = e.target.value;
+                                                                                        updateApiConfig(api._uid, { forceAsync: value === '' ? null : value === 'true', libraryId: null });
+                                                                                    }}
+                                                                                    className={`w-full rounded px-2 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    disabled={!isEditing}
+                                                                                >
+                                                                                    <option value="">{t('跟随供应商')}</option>
+                                                                                    <option value="true">{t('强制开启')}</option>
+                                                                                    <option value="false">{t('强制关闭')}</option>
+                                                                                </select>
+                                                                            </div>
+                                                                        </div>
+                                                                        <div className={`rounded border p-2 space-y-2 ${theme === 'dark' ? 'border-zinc-800 bg-zinc-900/50' : 'border-zinc-200 bg-white'}`}>
+                                                                            <div className="flex items-center justify-between">
+                                                                                <label className={`text-[10px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-700'}`}>{t('传输与能力')}</label>
+                                                                                <button
+                                                                                    onClick={() => {
+                                                                                        try {
+                                                                                            const parsed = JSON.parse(transportOptionsDraft || '{}');
+                                                                                            updateApiConfig(api._uid, { transportOptions: normalizeTransportOptions(parsed), libraryId: null });
+                                                                                            showToast(t('Transport 配置已更新'), 'success', 1500);
+                                                                                        } catch {
+                                                                                            showToast(t('Transport 选项 JSON 无效'), 'error', 1800);
+                                                                                        }
+                                                                                    }}
+                                                                                    disabled={!isEditing}
+                                                                                    className={`px-2 py-1 rounded text-[10px] ${theme === 'dark' ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300'} ${!isEditing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                                >
+                                                                                    {t('应用设置')}
+                                                                                </button>
+                                                                            </div>
+                                                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                                                                <div className="space-y-1 md:col-span-1">
+                                                                                    <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>{t('Transport')}</label>
+                                                                                    <select
+                                                                                        value={transportModeValue}
+                                                                                        onChange={(e) => updateApiConfig(api._uid, { transport: normalizeTransportMode(e.target.value), libraryId: null })}
+                                                                                        className={`w-full rounded px-2 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-900 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                        disabled={!isEditing}
+                                                                                    >
+                                                                                        <option value={TRANSPORT_HTTP_JSON}>HTTP JSON</option>
+                                                                                        <option value={TRANSPORT_HTTP_SSE}>HTTP SSE</option>
+                                                                                        <option value={TRANSPORT_WS_STREAM}>WS Stream</option>
+                                                                                    </select>
+                                                                                </div>
+                                                                                <div className="space-y-1 md:col-span-2">
+                                                                                    <label className={`text-[9px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-600'}`}>Transport Options JSON</label>
+                                                                                    <textarea
+                                                                                        value={transportOptionsDraft}
+                                                                                        onChange={(e) => setApiTransportOptionsDrafts(prev => ({ ...prev, [api._uid]: e.target.value }))}
+                                                                                        className={`w-full h-20 rounded px-2 py-1 text-[10px] border outline-none font-mono ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                        disabled={!isEditing}
+                                                                                    />
+                                                                                </div>
+                                                                            </div>
+                                                                            <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
+                                                                                {[
+                                                                                    ['supportsMultipart', 'Multipart'],
+                                                                                    ['supportsRequestChain', 'RequestChain'],
+                                                                                    ['supportsSSE', 'SSE'],
+                                                                                    ['supportsWS', 'WebSocket'],
+                                                                                    ['supportsTools', 'Tools']
+                                                                                ].map(([key, label]) => (
+                                                                                    <label key={key} className={`flex items-center gap-1 text-[10px] ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-700'}`}>
+                                                                                        <input
+                                                                                            type="checkbox"
+                                                                                            checked={capabilitiesValue[key] === true}
+                                                                                            onChange={(e) => updateApiConfig(api._uid, {
+                                                                                                capabilities: normalizeCapabilitySchema({ ...capabilitiesValue, [key]: e.target.checked }, api.type),
+                                                                                                libraryId: null
+                                                                                            })}
+                                                                                            disabled={!isEditing}
+                                                                                        />
+                                                                                        <span>{label}</span>
+                                                                                    </label>
+                                                                                ))}
+                                                                            </div>
+                                                                        </div>
+
+                                                                        <div className={`rounded border p-2 space-y-2 ${theme === 'dark' ? 'border-zinc-800 bg-zinc-900/50' : 'border-zinc-200 bg-white'}`}>
+                                                                            <div className="flex items-center justify-between">
+                                                                                <label className={`text-[10px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-700'}`}>{t('请求模板')}</label>
+                                                                                <button
+                                                                                    onClick={() => {
+                                                                                        try {
+                                                                                            const nextTemplate = normalizeRequestTemplate({
+                                                                                                ...(requestTemplateValue || getDefaultRequestTemplateForEntry(api)),
+                                                                                                endpoint: requestTemplateDraft.endpoint || requestTemplateValue?.endpoint || '',
+                                                                                                method: requestTemplateDraft.method || requestTemplateValue?.method || 'POST',
+                                                                                                bodyType: requestTemplateDraft.bodyType || requestTemplateValue?.bodyType || 'json',
+                                                                                                timeoutMs: requestTemplateDraft.timeoutMs === '' ? undefined : Number(requestTemplateDraft.timeoutMs),
+                                                                                                headers: JSON.parse(requestTemplateDraft.headers || '{}'),
+                                                                                                query: JSON.parse(requestTemplateDraft.query || '{}'),
+                                                                                                body: (requestTemplateDraft.bodyType || requestTemplateValue?.bodyType || 'json') === 'raw'
+                                                                                                    ? String(requestTemplateDraft.body || '')
+                                                                                                    : JSON.parse(requestTemplateDraft.body || '{}'),
+                                                                                                files: JSON.parse(requestTemplateDraft.files || '{}')
+                                                                                            });
+                                                                                            updateApiConfig(api._uid, { requestTemplate: nextTemplate, libraryId: null });
+                                                                                            showToast(t('请求模板已更新'), 'success', 1500);
+                                                                                        } catch {
+                                                                                            showToast(t('请求模板 JSON 无效'), 'error', 1800);
+                                                                                        }
+                                                                                    }}
+                                                                                    disabled={!isEditing}
+                                                                                    className={`px-2 py-1 rounded text-[10px] ${theme === 'dark' ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300'} ${!isEditing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                                >
+                                                                                    {t('保存模板')}
+                                                                                </button>
+                                                                            </div>
+                                                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                                                                <input
+                                                                                    type="text"
+                                                                                    value={requestTemplateDraft.endpoint || requestTemplateValue?.endpoint || ''}
+                                                                                    onChange={(e) => setApiRequestTemplateDrafts(prev => ({ ...prev, [api._uid]: { ...requestTemplateDraft, endpoint: e.target.value } }))}
+                                                                                    className={`rounded px-2 py-1 text-[10px] border outline-none md:col-span-2 ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder={t('请求路径，例如 /v1/chat/completions')}
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                                <div className="grid grid-cols-3 gap-1">
+                                                                                    <input
+                                                                                        type="text"
+                                                                                        value={requestTemplateDraft.method || requestTemplateValue?.method || 'POST'}
+                                                                                        onChange={(e) => setApiRequestTemplateDrafts(prev => ({ ...prev, [api._uid]: { ...requestTemplateDraft, method: e.target.value.toUpperCase() } }))}
+                                                                                        className={`rounded px-2 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                        disabled={!isEditing}
+                                                                                    />
+                                                                                    <select
+                                                                                        value={requestTemplateDraft.bodyType || requestTemplateValue?.bodyType || 'json'}
+                                                                                        onChange={(e) => setApiRequestTemplateDrafts(prev => ({ ...prev, [api._uid]: { ...requestTemplateDraft, bodyType: e.target.value } }))}
+                                                                                        className={`rounded px-1 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                        disabled={!isEditing}
+                                                                                    >
+                                                                                        <option value="json">json</option>
+                                                                                        <option value="raw">raw</option>
+                                                                                        <option value="multipart">multipart</option>
+                                                                                        <option value="auto">auto</option>
+                                                                                    </select>
+                                                                                    <input
+                                                                                        type="number"
+                                                                                        min="0"
+                                                                                        value={requestTemplateDraft.timeoutMs}
+                                                                                        onChange={(e) => setApiRequestTemplateDrafts(prev => ({ ...prev, [api._uid]: { ...requestTemplateDraft, timeoutMs: e.target.value } }))}
+                                                                                        className={`rounded px-1 py-1 text-[10px] border outline-none ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                        placeholder="timeout"
+                                                                                        disabled={!isEditing}
+                                                                                    />
+                                                                                </div>
+                                                                            </div>
+                                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                                                <textarea
+                                                                                    value={requestTemplateDraft.headers}
+                                                                                    onChange={(e) => setApiRequestTemplateDrafts(prev => ({ ...prev, [api._uid]: { ...requestTemplateDraft, headers: e.target.value } }))}
+                                                                                    className={`h-20 rounded px-2 py-1 text-[10px] border outline-none font-mono ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder="Headers JSON"
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                                <textarea
+                                                                                    value={requestTemplateDraft.query}
+                                                                                    onChange={(e) => setApiRequestTemplateDrafts(prev => ({ ...prev, [api._uid]: { ...requestTemplateDraft, query: e.target.value } }))}
+                                                                                    className={`h-20 rounded px-2 py-1 text-[10px] border outline-none font-mono ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder="Query JSON"
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                            </div>
+                                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                                                <textarea
+                                                                                    value={requestTemplateDraft.body}
+                                                                                    onChange={(e) => setApiRequestTemplateDrafts(prev => ({ ...prev, [api._uid]: { ...requestTemplateDraft, body: e.target.value } }))}
+                                                                                    className={`h-20 rounded px-2 py-1 text-[10px] border outline-none font-mono ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder={requestTemplateDraft.bodyType === 'raw' ? 'Raw Body' : 'Body JSON'}
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                                <textarea
+                                                                                    value={requestTemplateDraft.files}
+                                                                                    onChange={(e) => setApiRequestTemplateDrafts(prev => ({ ...prev, [api._uid]: { ...requestTemplateDraft, files: e.target.value } }))}
+                                                                                    className={`h-20 rounded px-2 py-1 text-[10px] border outline-none font-mono ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder="Files JSON"
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                            </div>
+                                                                        </div>
+
+                                                                        <div className={`rounded border p-2 space-y-2 ${theme === 'dark' ? 'border-zinc-800 bg-zinc-900/50' : 'border-zinc-200 bg-white'}`}>
+                                                                            <div className="flex items-center justify-between">
+                                                                                <label className={`text-[10px] font-medium uppercase tracking-wider ${theme === 'dark' ? 'text-zinc-400' : 'text-zinc-700'}`}>{t('自定义参数 / 异步任务 / Chain')}</label>
+                                                                                <div className="flex items-center gap-2">
+                                                                                    <button
+                                                                                        onClick={() => {
+                                                                                            try {
+                                                                                                const parsed = JSON.parse(customParamsDraft || '[]');
+                                                                                                updateApiConfig(api._uid, { customParams: normalizeCustomParams(parsed), libraryId: null });
+                                                                                                showToast(t('自定义参数已更新'), 'success', 1500);
+                                                                                            } catch {
+                                                                                                showToast(t('自定义参数 JSON 无效'), 'error', 1800);
+                                                                                            }
+                                                                                        }}
+                                                                                        disabled={!isEditing}
+                                                                                        className={`px-2 py-1 rounded text-[10px] ${theme === 'dark' ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300'} ${!isEditing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                                    >
+                                                                                        {t('保存参数')}
+                                                                                    </button>
+                                                                                    <button
+                                                                                        onClick={() => {
+                                                                                            try {
+                                                                                                const parsed = JSON.parse(asyncConfigDraft || '{}');
+                                                                                                updateApiConfig(api._uid, { asyncConfig: normalizeAsyncConfig(parsed), libraryId: null });
+                                                                                                showToast(t('异步任务配置已更新'), 'success', 1500);
+                                                                                            } catch {
+                                                                                                showToast(t('异步任务 JSON 无效'), 'error', 1800);
+                                                                                            }
+                                                                                        }}
+                                                                                        disabled={!isEditing}
+                                                                                        className={`px-2 py-1 rounded text-[10px] ${theme === 'dark' ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300'} ${!isEditing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                                    >
+                                                                                        {t('保存异步')}
+                                                                                    </button>
+                                                                                    <button
+                                                                                        onClick={() => {
+                                                                                            try {
+                                                                                                const parsed = JSON.parse(requestChainDraft || '{}');
+                                                                                                updateApiConfig(api._uid, { requestChain: normalizeRequestChain(parsed), libraryId: null });
+                                                                                                showToast(t('Request Chain 已更新'), 'success', 1500);
+                                                                                            } catch {
+                                                                                                showToast(t('Request Chain JSON 无效'), 'error', 1800);
+                                                                                            }
+                                                                                        }}
+                                                                                        disabled={!isEditing}
+                                                                                        className={`px-2 py-1 rounded text-[10px] ${theme === 'dark' ? 'bg-zinc-800 text-zinc-200 hover:bg-zinc-700' : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300'} ${!isEditing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                                    >
+                                                                                        {t('保存Chain')}
+                                                                                    </button>
+                                                                                </div>
+                                                                            </div>
+                                                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                                                                <textarea
+                                                                                    value={customParamsDraft}
+                                                                                    onChange={(e) => setApiCustomParamsDrafts(prev => ({ ...prev, [api._uid]: e.target.value }))}
+                                                                                    className={`h-32 rounded px-2 py-1 text-[10px] border outline-none font-mono ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder="Custom Params JSON[]"
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                                <textarea
+                                                                                    value={asyncConfigDraft}
+                                                                                    onChange={(e) => setApiAsyncConfigDrafts(prev => ({ ...prev, [api._uid]: e.target.value }))}
+                                                                                    className={`h-32 rounded px-2 py-1 text-[10px] border outline-none font-mono ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder="Async Config JSON"
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                                <textarea
+                                                                                    value={requestChainDraft}
+                                                                                    onChange={(e) => setApiRequestChainDrafts(prev => ({ ...prev, [api._uid]: e.target.value }))}
+                                                                                    className={`h-32 rounded px-2 py-1 text-[10px] border outline-none font-mono ${theme === 'dark' ? 'bg-zinc-950 border-zinc-800 text-zinc-300' : 'bg-white border-zinc-300 text-zinc-900'}`}
+                                                                                    placeholder="Request Chain JSON"
+                                                                                    disabled={!isEditing}
+                                                                                />
+                                                                            </div>
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+                                                            </div>
+                                                        );
+                                                    })}
+                                                    {selectedProviderModels.length === 0 && (
+                                                        <div className={`px-2 py-2 text-[11px] ${theme === 'dark' ? 'text-zinc-500' : 'text-zinc-500'}`}>{t('该供应商暂无模型，请点击“添加模型”。')}</div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            )}
+
+                            {false && (
                                 <div className="p-4 space-y-3">
                                     <div className="flex items-center justify-between">
                                         <div>
@@ -40355,12 +40858,31 @@ ${inputText.substring(0, 15000)} ... (截断)
                                 </div>
                             )}
 
-                            <div className={`pt-2 flex justify-end gap-2 border-t mt-3 ${theme === 'dark' ? 'border-zinc-800' : 'border-zinc-200'}`}>
+                            <div className={`sticky bottom-0 pt-2 pb-2 px-1 flex justify-end gap-2 border-t mt-3 backdrop-blur-sm ${theme === 'dark' ? 'border-zinc-800 bg-zinc-950/90' : 'border-zinc-200 bg-white/95'}`}>
+                                <Button
+                                    className="bg-blue-600 hover:bg-blue-500"
+                                    onClick={() => {
+                                        try {
+                                            localStorage.setItem('tapnow_global_key', globalApiKey || '');
+                                            localStorage.setItem('tapnow_providers', JSON.stringify(providers));
+                                            localStorage.setItem('tapnow_api_configs', JSON.stringify(apiConfigs));
+                                            localStorage.setItem('tapnow_model_library', JSON.stringify(modelLibrary));
+                                            localStorage.setItem('tapnow_model_library_collapsed', JSON.stringify(Array.from(collapsedLibraryModels)));
+                                            showToast(t('配置已保存'), 'success', 1800);
+                                        } catch (e) {
+                                            showToast(t('保存失败，请检查浏览器存储空间'), 'error', 2200);
+                                        }
+                                    }}
+                                >
+                                    {t('保存')}
+                                </Button>
                                 <Button variant="secondary" onClick={() => setSettingsOpen(false)}>{t('关闭')}</Button>
                             </div>
-
-
-                        </Modal>
+                                    </div>
+                                </div>
+                            </div>
+                            </div>
+                        )}
 
                         {/* 批量素材管理模态框 */}
                         {batchModalOpen && (
@@ -40839,7 +41361,7 @@ ${inputText.substring(0, 15000)} ... (截断)
             )}
 
             {/* V3.7.27: Toast 通知容器 */}
-            < div className="fixed top-20 left-1/2 -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none" >
+            < div className="fixed top-20 left-1/2 -translate-x-1/2 z-[12000] flex flex-col gap-2 pointer-events-none" >
                 {
                     toasts.map(toast => (
                         <div

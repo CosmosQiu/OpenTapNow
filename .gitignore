@@ -3,6 +3,8 @@ config/
 tapnow_data/
 mysql_data/
 localserver/data/
+localserver/__pycache__/
+node_modules/
 
 # Environment files
 .env

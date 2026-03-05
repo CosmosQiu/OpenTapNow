@@ -26,11 +26,84 @@ from config import (
 # SECTION 1: 日志和文件操作
 # ==============================================================================
 
-def log(message):
-    """统一日志输出"""
-    if config["log_enabled"] and FEATURES["log_console"]:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{timestamp}] {message}")
+LOG_MODE_RANK = {
+    'error': 0,
+    'normal': 1,
+    'debug': 2,
+}
+
+SENSITIVE_HEADER_KEYS = {
+    'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
+    'x-api-key', 'api-key', 'x-auth-token'
+}
+
+
+def get_log_mode():
+    mode = str(config.get('log_mode', 'normal') or 'normal').strip().lower()
+    return mode if mode in LOG_MODE_RANK else 'normal'
+
+
+def should_log(level='normal'):
+    current_rank = LOG_MODE_RANK.get(get_log_mode(), 1)
+    required_rank = LOG_MODE_RANK.get(str(level or 'normal').strip().lower(), 1)
+    return current_rank >= required_rank
+
+
+def log(message, level='normal'):
+    """统一日志输出（支持 debug/normal/error 分级）"""
+    if not (config.get("log_enabled", True) and FEATURES.get("log_console", True)):
+        return
+    if not should_log(level):
+        return
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}")
+
+
+def log_debug(message):
+    log(message, level='debug')
+
+
+def log_info(message):
+    log(message, level='normal')
+
+
+def log_error(message):
+    log(message, level='error')
+
+
+def redact_sensitive_headers(headers):
+    if not isinstance(headers, dict):
+        return {}
+    redacted = {}
+    for key, value in headers.items():
+        key_text = str(key)
+        if key_text.strip().lower() in SENSITIVE_HEADER_KEYS:
+            redacted[key_text] = '***'
+        else:
+            redacted[key_text] = value
+    return redacted
+
+
+def preview_payload(value, max_kb=8):
+    """返回用于日志展示的 payload 摘要，默认最多 8KB。"""
+    limit = max(1, int(max_kb or 8)) * 1024
+    if value is None:
+        return ''
+    if isinstance(value, bytes):
+        text = value[:limit].decode('utf-8', errors='replace')
+        suffix = ' ...<truncated>' if len(value) > limit else ''
+        return text + suffix
+    if isinstance(value, (dict, list, tuple)):
+        try:
+            text = json.dumps(value, ensure_ascii=False)
+        except Exception:
+            text = str(value)
+    else:
+        text = str(value)
+    if len(text.encode('utf-8', errors='replace')) <= limit:
+        return text
+    encoded = text.encode('utf-8', errors='replace')
+    return encoded[:limit].decode('utf-8', errors='replace') + ' ...<truncated>'
 
 def ensure_dir(path):
     """确保目录存在"""

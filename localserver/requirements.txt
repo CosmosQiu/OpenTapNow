@@ -1,6 +1,9 @@
 # Tapnow Local Server Python Dependencies
 # ========================================
 
+# 环境变量加载 (.env 文件)
+python-dotenv>=1.0.0
+
 # 图像处理 (PNG转JPG功能)
 Pillow>=9.0.0
 

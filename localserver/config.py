@@ -38,6 +38,11 @@ def get_env_bool(key, default):
         return default
     return val.lower() in ('true', '1', 'yes', 'on')
 
+
+def get_env_log_mode(default='normal'):
+    value = str(os.environ.get('TAPNOW_LOG_MODE', default) or default).strip().lower()
+    return value if value in ('debug', 'normal', 'error') else default
+
 FEATURES = {
     # 核心文件服务 (默认开启)
     "file_server": get_env_bool("TAPNOW_ENABLE_FILE_SERVER", True),
@@ -99,6 +104,7 @@ config = {
     "auto_create_dir": True,
     "allow_overwrite": False,
     "log_enabled": True,
+    "log_mode": get_env_log_mode('normal'),
     "convert_png_to_jpg": True,
     "jpg_quality": 95
 }

@@ -21,7 +21,7 @@ from utils import (
     is_image_file, is_video_file, is_media_content_type, is_media_path,
     convert_png_to_jpg, parse_proxy_target, is_proxy_target_allowed,
     iter_proxy_response_chunks, PROXY_SKIP_REQUEST_HEADERS, PROXY_SKIP_RESPONSE_HEADERS,
-    PROXY_MEDIA_CACHE_CONTROL
+    PROXY_MEDIA_CACHE_CONTROL, log_debug, log_error, redact_sensitive_headers, preview_payload
 )
 from comfy_middleware import (
     ComfyMiddleware, resolve_job_by_request_id, build_detail_response, build_outputs_response,
@@ -37,12 +37,28 @@ from db import db_manager
 class TapnowFullHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
-        # 覆盖默认日志，使用统一的 log 函数
-        if config.get("log_enabled", True) and FEATURES.get("log_console", True):
+        # 覆盖默认日志，按 log_mode 控制输出粒度
+        if not (config.get("log_enabled", True) and FEATURES.get("log_console", True)):
+            return
+        mode = str(config.get('log_mode', 'normal') or 'normal').strip().lower()
+        try:
+            message = format % args
+        except Exception:
+            message = 'request received'
+
+        status_code = None
+        if len(args) >= 2:
             try:
-                log(f"HTTP: {format % args}")
+                status_code = int(args[1])
             except Exception:
-                log("HTTP: request received")
+                status_code = None
+
+        if mode == 'debug':
+            log_debug(f"HTTP: {message}")
+            return
+
+        if status_code is not None and status_code >= 400:
+            log_error(f"HTTP: {message}")
 
     # --- 基础 Helper ---
 
@@ -126,7 +142,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
         for key in (
             'save_path', 'image_save_path', 'video_save_path', 'auto_create_dir',
             'allow_overwrite', 'convert_png_to_jpg', 'jpg_quality',
-            'proxy_allowed_hosts', 'proxy_timeout', 'log_enabled'
+            'proxy_allowed_hosts', 'proxy_timeout', 'log_enabled', 'log_mode'
         ):
             if key in data:
                 config[key] = data[key]
@@ -1202,6 +1218,10 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             # 仅在明确提供布尔值时更新，避免 null/空字符串误关闭日志
             if isinstance(data['log_enabled'], bool):
                 config['log_enabled'] = data['log_enabled']
+        if 'log_mode' in data:
+            mode = str(data.get('log_mode') or '').strip().lower()
+            if mode in ('debug', 'normal', 'error'):
+                config['log_mode'] = mode
         if 'convert_png_to_jpg' in data:
             config['convert_png_to_jpg'] = bool(data['convert_png_to_jpg'])
         if 'jpg_quality' in data:
@@ -1227,7 +1247,8 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                 "jpg_quality": config["jpg_quality"],
                 "proxy_allowed_hosts": config.get("proxy_allowed_hosts", []),
                 "proxy_timeout": config.get("proxy_timeout", DEFAULT_PROXY_TIMEOUT),
-                "log_enabled": config.get("log_enabled", True)
+                "log_enabled": config.get("log_enabled", True),
+                "log_mode": config.get("log_mode", 'normal')
             }, user.get('id') if user else None)
             self._audit(user, 'config_update', 'system_config', 'server_config', data)
         log("配置已更新")
@@ -1594,6 +1615,12 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
         if parsed_target.netloc:
             forward_headers['Host'] = parsed_target.netloc
 
+        log_debug(
+            f"[Proxy][Request] method={method} target={target_url} "
+            f"headers={preview_payload(redact_sensitive_headers(forward_headers), max_kb=4)} "
+            f"body={preview_payload(body, max_kb=8)}"
+        )
+
         path = parsed_target.path or '/'
         if parsed_target.query:
             path = f"{path}?{parsed_target.query}"
@@ -1607,7 +1634,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             conn.request(method, path, body=body, headers=forward_headers)
             resp = conn.getresponse()
         except Exception as exc:
-            log(f"代理请求失败: {exc}")
+            log_error(f"[Proxy][Error] 代理请求失败: {exc}")
             self._send_json({"success": False, "error": f"代理请求失败: {exc}"}, 502)
             try:
                 conn.close()
@@ -1641,13 +1668,37 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             if method == 'HEAD':
+                log_debug(
+                    f"[Proxy][Response] method={method} target={target_url} "
+                    f"status={resp.status} content_type={content_type} body=<HEAD:no body>"
+                )
                 return
 
+            response_preview_chunks = []
+            response_preview_size = 0
+            response_preview_limit = 8 * 1024
             for chunk in iter_proxy_response_chunks(resp):
+                if response_preview_size < response_preview_limit:
+                    remaining = response_preview_limit - response_preview_size
+                    if remaining > 0:
+                        sample = chunk[:remaining]
+                        response_preview_chunks.append(sample)
+                        response_preview_size += len(sample)
                 self.wfile.write(chunk)
                 self.wfile.flush()
+
+            preview_blob = b''.join(response_preview_chunks)
+            suffix = ' ...<truncated>' if response_preview_size >= response_preview_limit else ''
+            log_debug(
+                f"[Proxy][Response] method={method} target={target_url} "
+                f"status={resp.status} content_type={content_type} "
+                f"body={preview_payload(preview_blob, max_kb=8)}{suffix}"
+            )
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception as exc:
+            log_error(f"[Proxy][Error] 响应转发失败: {exc}")
+            raise
         finally:
             resp.close()
             conn.close()

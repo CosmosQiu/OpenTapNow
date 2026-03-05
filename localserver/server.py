@@ -16,6 +16,21 @@ import sys
 import argparse
 import threading
 from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+# 加载 .env 文件 (必须在导入 db 模块之前)
+try:
+    from dotenv import load_dotenv
+    # 从项目根目录加载 .env
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, override=True)
+        print(f"[配置] 已加载环境变量: {env_path}")
+    else:
+        # 尝试从当前工作目录加载
+        load_dotenv(override=True)
+except ImportError:
+    pass  # python-dotenv 未安装时跳过
 
 # 导入各模块
 from config import config, FEATURES, DEFAULT_PORT, WORKFLOWS_DIR
@@ -53,6 +68,8 @@ def main():
         else:
             log("未配置数据库连接串，使用文件系统兼容模式")
     except Exception as exc:
+        db_manager.enabled = False
+        db_manager.engine = None
         log(f"数据库初始化失败，将继续以文件系统模式运行: {exc}")
 
     # 2. 准备目录
