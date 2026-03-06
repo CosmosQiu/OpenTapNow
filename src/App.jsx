@@ -2066,6 +2066,41 @@ const normalizeRequestTemplate = (template) => {
     };
     return normalized;
 };
+const buildComparableRequestTemplate = (template) => {
+    if (!template || typeof template !== 'object') return null;
+    return {
+        endpoint: typeof template.endpoint === 'string' ? template.endpoint.trim() : '',
+        method: (template.method || 'POST').toString().toUpperCase(),
+        bodyType: (template.bodyType || 'json').toString().toLowerCase(),
+        headers: (template.headers && typeof template.headers === 'object' && !Array.isArray(template.headers))
+            ? template.headers
+            : {},
+        query: (template.query && typeof template.query === 'object' && !Array.isArray(template.query))
+            ? template.query
+            : {},
+        files: (template.files && typeof template.files === 'object' && !Array.isArray(template.files))
+            ? template.files
+            : {},
+        timeoutMs: Number.isFinite(template.timeoutMs) ? Number(template.timeoutMs) : null,
+        responseParser: typeof template.responseParser === 'string' ? template.responseParser.trim() : '',
+        body: (template.body && typeof template.body === 'object' && !Array.isArray(template.body))
+            ? template.body
+            : (template.body ?? {})
+    };
+};
+const shouldApplyRequestTemplate = (entry, requestTemplate) => {
+    if (!requestTemplate) return false;
+    if (requestTemplate.enabled) return true;
+    const defaultTemplate = normalizeRequestTemplate(getDefaultRequestTemplateForEntry(entry || {}));
+    if (!defaultTemplate) return false;
+    try {
+        const currentComparable = buildComparableRequestTemplate(requestTemplate);
+        const defaultComparable = buildComparableRequestTemplate(defaultTemplate);
+        return JSON.stringify(currentComparable) !== JSON.stringify(defaultComparable);
+    } catch (e) {
+        return false;
+    }
+};
 const normalizeTransportMode = (transport) => {
     const raw = String(transport || '').trim().toLowerCase();
     if (raw === TRANSPORT_HTTP_SSE || raw === 'sse' || raw === 'http_sse') return TRANSPORT_HTTP_SSE;
@@ -4520,7 +4555,6 @@ function TapnowApp() {
             console.warn('配置缓存版本迁移失败:', e);
         }
     }, []);
-
     // API 黑名单机制 (比照 Jimeng-api-tool 实现)
     const [apiBlacklist, setApiBlacklist] = useState(() => {
         try {
@@ -4746,6 +4780,111 @@ function TapnowApp() {
             return '';
         }
     }, [localServerToken, localServerUsername, localServerPassword, currentUser]);
+    const configHydratedFromServerRef = useRef(false);
+    const configSyncTimerRef = useRef(null);
+    const buildApiConfigPersistPayload = useCallback(() => ({
+        version: '2.0',
+        updated_at: new Date().toISOString(),
+        global_api_key: globalApiKey || '',
+        providers: providers || {},
+        api_configs: Array.isArray(apiConfigs) ? apiConfigs : [],
+        model_library: Array.isArray(modelLibrary) ? modelLibrary : []
+    }), [globalApiKey, providers, apiConfigs, modelLibrary]);
+    useEffect(() => {
+        if (configHydratedFromServerRef.current) return;
+        if (!currentUser) return;
+        const base = (localServerUrl || '').replace(/\/+$/, '');
+        if (!base) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const token = localServerToken || await ensureLocalServerAuth(base);
+                const headers = token ? { Authorization: `Bearer ${token}` } : buildLocalServerHeaders();
+                const resp = await fetch(`${base}/api-config`, { method: 'GET', headers });
+                if (!resp.ok) return;
+                const payload = await resp.json();
+                const data = payload?.data;
+                if (!data || typeof data !== 'object') {
+                    configHydratedFromServerRef.current = true;
+                    return;
+                }
+                if (cancelled) return;
+                if (typeof data.global_api_key === 'string') {
+                    setGlobalApiKey(data.global_api_key);
+                }
+                if (data.providers && typeof data.providers === 'object' && !Array.isArray(data.providers)) {
+                    const providerEntries = Object.entries(data.providers);
+                    if (providerEntries.length > 0) {
+                        setProviders(Object.fromEntries(providerEntries.map(([key, config]) => [key, normalizeProviderConfig(key, config)])));
+                    }
+                }
+                if (Array.isArray(data.api_configs) && data.api_configs.length > 0) {
+                    const normalizedApiConfigs = data.api_configs
+                        .map(config => ({
+                            ...config,
+                            id: config.id || config.modelName,
+                            provider: config.provider,
+                            type: config.type || 'Chat',
+                            modelName: config.modelName || config.id,
+                            displayName: config.displayName || config.modelName || config.id,
+                            ...(config.durations ? { durations: config.durations } : {}),
+                            _uid: config._uid || `uid-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+                        }))
+                        .filter(c => c && !DELETED_MODEL_IDS.includes(c.id));
+                    if (normalizedApiConfigs.length > 0) {
+                        setApiConfigs(normalizedApiConfigs);
+                    }
+                }
+                if (Array.isArray(data.model_library) && data.model_library.length > 0) {
+                    const normalizedLibrary = data.model_library
+                        .map((entry, idx) => normalizeModelLibraryEntry(entry, idx))
+                        .filter(Boolean);
+                    if (normalizedLibrary.length > 0) {
+                        setModelLibrary(normalizedLibrary);
+                    }
+                }
+                configHydratedFromServerRef.current = true;
+            } catch (e) {
+                // ignore and keep localStorage as fallback
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [currentUser, localServerUrl, localServerToken, ensureLocalServerAuth, buildLocalServerHeaders]);
+    useEffect(() => {
+        if (!currentUser) return;
+        if (!configHydratedFromServerRef.current) return;
+        const base = (localServerUrl || '').replace(/\/+$/, '');
+        if (!base) return;
+        if (configSyncTimerRef.current) {
+            clearTimeout(configSyncTimerRef.current);
+        }
+        configSyncTimerRef.current = setTimeout(async () => {
+            try {
+                const token = localServerToken || await ensureLocalServerAuth(base);
+                const headers = token
+                    ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+                    : buildLocalServerHeaders({ 'Content-Type': 'application/json' });
+                await fetch(`${base}/api-config`, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({
+                        action: 'update',
+                        config: buildApiConfigPersistPayload()
+                    })
+                });
+            } catch (e) {
+                console.warn('[Config Sync] 保存到数据库失败，已保留本地配置');
+            }
+        }, 800);
+        return () => {
+            if (configSyncTimerRef.current) {
+                clearTimeout(configSyncTimerRef.current);
+                configSyncTimerRef.current = null;
+            }
+        };
+    }, [currentUser, localServerUrl, localServerToken, providers, apiConfigs, modelLibrary, globalApiKey, ensureLocalServerAuth, buildLocalServerHeaders, buildApiConfigPersistPayload]);
 
     // V2.6.1 Feature: 本地缓存服务器状态
     const [localCacheServerConnected, setLocalCacheServerConnected] = useState(false);
@@ -8152,6 +8291,48 @@ function TapnowApp() {
         const noLibrary = byId.find(c => !c.libraryId);
         return noLibrary || byId[0];
     }, [apiConfigsMap, apiConfigsById]);
+    const resolveRuntimeRequestTemplate = useCallback((config, modelKey) => {
+        const baseTemplate = normalizeRequestTemplate(config?.requestTemplate);
+        const draftKey = String(modelKey || '').trim();
+        const draft = draftKey ? apiRequestTemplateDrafts[draftKey] : null;
+        if (!draft || typeof draft !== 'object') return baseTemplate;
+        try {
+            const effectiveBodyType = (draft.bodyType || baseTemplate?.bodyType || 'json').toString().toLowerCase();
+            const headersText = draft.headers ?? JSON.stringify(baseTemplate?.headers || {});
+            const queryText = draft.query ?? JSON.stringify(baseTemplate?.query || {});
+            const filesText = draft.files ?? JSON.stringify(baseTemplate?.files || {});
+            const bodyText = draft.body ?? (
+                effectiveBodyType === 'raw'
+                    ? (typeof baseTemplate?.body === 'string' ? baseTemplate.body : '')
+                    : JSON.stringify(baseTemplate?.body || {})
+            );
+            const parsedHeaders = JSON.parse(String(headersText || '{}'));
+            const parsedQuery = JSON.parse(String(queryText || '{}'));
+            const parsedFiles = JSON.parse(String(filesText || '{}'));
+            const parsedBody = effectiveBodyType === 'raw'
+                ? String(bodyText || '')
+                : JSON.parse(String(bodyText || '{}'));
+            const timeoutRaw = draft.timeoutMs;
+            const timeoutMs = timeoutRaw === '' || timeoutRaw === null || timeoutRaw === undefined
+                ? (baseTemplate?.timeoutMs ?? null)
+                : Number(timeoutRaw);
+            const merged = normalizeRequestTemplate({
+                ...(baseTemplate || getDefaultRequestTemplateForEntry(config || {})),
+                endpoint: draft.endpoint ?? baseTemplate?.endpoint ?? '',
+                method: draft.method || baseTemplate?.method || 'POST',
+                bodyType: effectiveBodyType,
+                headers: parsedHeaders,
+                query: parsedQuery,
+                files: parsedFiles,
+                body: parsedBody,
+                timeoutMs,
+                enabled: true
+            });
+            return merged || baseTemplate;
+        } catch (e) {
+            return baseTemplate;
+        }
+    }, [apiConfigsMap, apiRequestTemplateDrafts]);
 
     const resolveModelKey = useCallback((modelKey) => {
         if (!modelKey) return '';
@@ -8257,6 +8438,81 @@ function TapnowApp() {
         if (!base) return targetUrl;
         return `${base}/proxy?url=${encodeURIComponent(targetUrl)}`;
     }, [providers, localServerUrl]);
+    const buildBackendProxyUrl = useCallback((targetUrl) => {
+        if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) return targetUrl;
+        const base = (localServerUrl || '').trim().replace(/\/+$/, '');
+        if (!base) return targetUrl;
+        try {
+            const targetOrigin = new URL(targetUrl).origin;
+            const localOrigin = new URL(base).origin;
+            if (targetOrigin === localOrigin) return targetUrl;
+        } catch (e) {
+            return targetUrl;
+        }
+        return `${base}/proxy?url=${encodeURIComponent(targetUrl)}`;
+    }, [localServerUrl]);
+    const buildVideoRequestUrl = useCallback((targetUrl, providerKey) => {
+        const providerProxyUrl = buildProxyUrl(targetUrl, providerKey);
+        if (providerProxyUrl !== targetUrl) return providerProxyUrl;
+        return buildBackendProxyUrl(targetUrl);
+    }, [buildProxyUrl, buildBackendProxyUrl]);
+    const requestVideoGenerationViaBackend = useCallback(async ({
+        targetUrl,
+        targetMethod = 'POST',
+        headers = {},
+        body = null,
+        modelId = '',
+        pollPathHint = '',
+        maxAttempts,
+        delayMs
+    }) => {
+        const base = (localServerUrl || '').trim().replace(/\/+$/, '');
+        if (!base) throw new Error('本地后端地址未配置');
+        if (!targetUrl || !/^https?:\/\//i.test(String(targetUrl))) {
+            throw new Error('视频请求目标地址无效');
+        }
+
+        const requestHeaders = { ...(headers || {}) };
+        requestHeaders['X-Target-Url'] = String(targetUrl);
+        requestHeaders['X-Target-Method'] = String(targetMethod || 'POST').toUpperCase();
+        if (modelId) requestHeaders['X-Model-Id'] = String(modelId);
+        if (pollPathHint) requestHeaders['X-Poll-Path-Hint'] = String(pollPathHint);
+        if (Number.isFinite(maxAttempts)) requestHeaders['X-Poll-Max-Attempts'] = String(maxAttempts);
+        if (Number.isFinite(delayMs)) requestHeaders['X-Poll-Delay-Ms'] = String(delayMs);
+
+        let requestBody = body;
+        if (requestBody instanceof FormData) {
+            delete requestHeaders['Content-Type'];
+            delete requestHeaders['content-type'];
+        }
+
+        const resp = await fetch(`${base}/video/generate`, {
+            method: 'POST',
+            headers: requestHeaders,
+            body: requestBody
+        });
+
+        const text = await resp.text();
+        let payload;
+        try {
+            payload = text ? JSON.parse(text) : {};
+        } catch (e) {
+            throw new Error(text || `视频后端请求失败: ${resp.status}`);
+        }
+        if (!resp.ok || payload?.success === false) {
+            throw new Error(payload?.error || text || `视频后端请求失败: ${resp.status}`);
+        }
+        if (payload && typeof payload === 'object' && payload.success === true) {
+            const data = payload.data && typeof payload.data === 'object' ? { ...payload.data } : {};
+            const finalUrl = payload.video_url || data.video_url || data.url || data.output;
+            if (finalUrl) {
+                if (!data.video_url) data.video_url = finalUrl;
+                if (!data.url) data.url = finalUrl;
+            }
+            return data;
+        }
+        return payload;
+    }, [localServerUrl]);
 
     const getModelLabel = useCallback((modelId) => {
         if (!modelId) return '选择模型';
@@ -13398,7 +13654,7 @@ function TapnowApp() {
         };
     }, [updateNodeSettings, handleVideoFileUpload, setNodes, setConnections, setSelectedNodeId, setSelectedNodeIds, view]);
 
-    const pollVeoJob = async (jobId, taskId, baseUrl, apiKey, w, h, attempt = 0) => {
+    const pollVeoJob = async (jobId, taskId, baseUrl, apiKey, w, h, attempt = 0, providerKey = '') => {
         const maxAttempts = 90; // 增加到90次，支持最长360秒（6分钟）的生成时间
         const delayMs = 4000;
 
@@ -13417,14 +13673,15 @@ function TapnowApp() {
             return;
         }
 
-        fetch(`${baseUrl}/v2/videos/generations/${jobId}`, {
+        const pollEndpoint = buildVideoRequestUrl(`${baseUrl}/v2/videos/generations/${encodeURIComponent(jobId)}`, providerKey);
+        fetch(pollEndpoint, {
             method: 'GET',
             headers: { Authorization: `Bearer ${apiKey}` },
         })
             .then(async (resp) => {
                 const text = await resp.text();
                 let data;
-                try { data = JSON.parse(text); } catch (err) { setTimeout(() => pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h, attempt + 1), delayMs); return; }
+                try { data = JSON.parse(text); } catch (err) { setTimeout(() => pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h, attempt + 1, providerKey), delayMs); return; }
 
                 const status = data?.data?.status || data?.status || data?.data?.task_status;
                 const progress = data?.data?.progress || data?.progress || '0%';
@@ -13632,19 +13889,19 @@ function TapnowApp() {
                         progress: Math.max(5, currentProgress),
                         errorMsg: status === 'NOT_START' ? '任务已创建，等待处理中...' : undefined
                     } : hItem));
-                    setTimeout(() => pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h, attempt + 1), delayMs);
+                    setTimeout(() => pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h, attempt + 1, providerKey), delayMs);
                     return;
                 }
 
                 // 其他状态（如 PROCESSING、GENERATING 等）：继续轮询
                 const currentProgress = parseInt(progress) || Math.min(95, (attempt * 2) + 10);
                 setHistory((prev) => prev.map((hItem) => hItem.id === taskId ? { ...hItem, status: 'generating', progress: currentProgress } : hItem));
-                setTimeout(() => pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h, attempt + 1), delayMs);
+                setTimeout(() => pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h, attempt + 1, providerKey), delayMs);
             })
-            .catch((err) => setTimeout(() => pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h, attempt + 1), delayMs));
+            .catch((err) => setTimeout(() => pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h, attempt + 1, providerKey), delayMs));
     };
 
-    const pollSoraJob = (jobId, taskId, baseUrl, apiKey, w, h, modelId = '', attempt = 0) => {
+    const pollSoraJob = (jobId, taskId, baseUrl, apiKey, w, h, modelId = '', attempt = 0, pollPathHint = '') => {
         // V3.5.15 debug: Prevent polling with null/undefined jobId
         if (!jobId || jobId === 'null' || jobId === 'undefined') {
             console.error(`[Poll Error] Invalid JobId: ${jobId} for task ${taskId}`);
@@ -13676,11 +13933,14 @@ function TapnowApp() {
             return;
         }
 
-        const pollEndpoint = modelId?.includes('grok')
+        const useV2Poll = modelId?.includes('grok') || /\/v2\/videos\/generations/i.test(String(pollPathHint || ''));
+        const pollEndpoint = useV2Poll
             ? `${baseUrl}/v2/videos/generations/${encodeURIComponent(jobId)}`
             : `${baseUrl}/v1/videos/${encodeURIComponent(jobId)}`;
+        const soraProviderKey = getApiConfigByKey(modelId)?.provider;
+        const finalPollEndpoint = buildVideoRequestUrl(pollEndpoint, soraProviderKey);
 
-        fetch(pollEndpoint, {
+        fetch(finalPollEndpoint, {
             method: 'GET',
             headers: { Authorization: `Bearer ${apiKey}` },
         })
@@ -13696,14 +13956,16 @@ function TapnowApp() {
                     data = JSON.parse(text);
                 } catch (err) {
                     console.error('[Tapnow] Sora/Grok Poll JSON 解析失败:', err, text);
-                    setTimeout(() => pollSoraJob(jobId, taskId, baseUrl, apiKey, w, h, modelId, attempt + 1), delayMs);
+                    setTimeout(() => pollSoraJob(jobId, taskId, baseUrl, apiKey, w, h, modelId, attempt + 1, pollPathHint), delayMs);
                     return;
                 }
 
                 const status = data?.data?.status || data?.status || data?.data?.task_status || data?.task_status;
+                const outputVideoUrl = data?.data?.output || data?.output || data?.data?.video_url || data?.data?.url || data?.video_url || data?.url;
+                const hasOutputVideo = typeof outputVideoUrl === 'string' && outputVideoUrl.trim().length > 0;
 
-                if (status === 'SUCCESS' || status === 'succeeded' || status === 'FINISHED' || status === 'completed') {
-                    const videoUrl = data?.data?.output || data?.output || data?.data?.video_url || data?.data?.url || data?.video_url || data?.url;
+                if (hasOutputVideo || status === 'SUCCESS' || status === 'succeeded' || status === 'FINISHED' || status === 'completed') {
+                    const videoUrl = outputVideoUrl;
                     if (!videoUrl) {
                         setHistory(prev => prev.map(hItem => hItem.id === taskId ? { ...hItem, status: 'failed', errorMsg: '未找到视频URL' } : hItem));
                         return;
@@ -13763,14 +14025,14 @@ function TapnowApp() {
                 }
 
                 setHistory(prev => prev.map(hItem => hItem.id === taskId ? { ...hItem, status: 'generating', progress: Math.min(95, (hItem.progress || 10) + 2) } : hItem));
-                setTimeout(() => pollSoraJob(jobId, taskId, baseUrl, apiKey, w, h, modelId, attempt + 1), delayMs);
+                setTimeout(() => pollSoraJob(jobId, taskId, baseUrl, apiKey, w, h, modelId, attempt + 1, pollPathHint), delayMs);
             })
             .catch(err => {
                 console.error('[Tapnow] Sora/Grok Poll 请求失败:', err);
                 // 如果是网络错误，继续重试；如果是其他错误，标记为失败
                 if (attempt < maxAttempts - 5) {
                     // 前75次尝试继续重试
-                    setTimeout(() => pollSoraJob(jobId, taskId, baseUrl, apiKey, w, h, modelId, attempt + 1), delayMs);
+                    setTimeout(() => pollSoraJob(jobId, taskId, baseUrl, apiKey, w, h, modelId, attempt + 1, pollPathHint), delayMs);
                 } else {
                     // 最后5次尝试失败后，标记为失败
                     setHistory(prev => prev.map(hItem => hItem.id === taskId ? { ...hItem, status: 'failed', errorMsg: `轮询失败: ${err.message || '网络错误'}` } : hItem));
@@ -15715,10 +15977,10 @@ function TapnowApp() {
                 const forceAsync = !!credentials.forceAsync;
                 const omitRatioOnSubmit = !!config?.omitRatioOnSubmit;
                 const omitResolutionOnSubmit = !!config?.omitResolutionOnSubmit;
-                const requestTemplate = normalizeRequestTemplate(config?.requestTemplate);
+                const requestTemplate = resolveRuntimeRequestTemplate(config, modelId);
                 const requestOverrideEnabled = !!config?.requestOverrideEnabled;
                 const requestOverridePatch = normalizeRequestOverridePatch(config?.requestOverridePatch);
-                const requestTemplateEnabled = !!requestTemplate?.enabled;
+                const requestTemplateEnabled = shouldApplyRequestTemplate(config, requestTemplate);
                 const isModelScope = apiType === 'modelscope';
                 const isGeminiNative = apiType === 'gemini';
                 const isChatImage = config?.type === 'ChatImage';
@@ -16448,7 +16710,7 @@ function TapnowApp() {
                 };
 
                 let requestOverride = null;
-                if (requestTemplate?.enabled) {
+                if (requestTemplateEnabled) {
                     const buildRequestTemplateVars = async () => {
                         const vars = {
                             modelName: config?.modelName || modelId,
@@ -17164,7 +17426,8 @@ function TapnowApp() {
                 const isOpenAISora = !isJimengVideo && (modelId.includes('sora') || modelName.includes('sora'));
                 const isGrokVideo = providerKey === 'grok' || modelId.includes('grok') || modelName.includes('grok');
                 const useProxy = !!credentials.useProxy;
-                const requestTemplate = normalizeRequestTemplate(config?.requestTemplate);
+                const requestTemplate = resolveRuntimeRequestTemplate(config, modelId);
+                const requestTemplateEnabled = shouldApplyRequestTemplate(config, requestTemplate);
                 const requestOverrideEnabled = !!config?.requestOverrideEnabled;
                 const requestOverridePatch = normalizeRequestOverridePatch(config?.requestOverridePatch);
                 const omitRatioOnSubmit = !!config?.omitRatioOnSubmit;
@@ -17351,32 +17614,45 @@ function TapnowApp() {
                     });
 
                     try {
-                        const resp = await fetch(endpoint, {
-                            method: 'POST',
+                        const data = await requestVideoGenerationViaBackend({
+                            targetUrl: endpoint,
+                            targetMethod: 'POST',
                             headers: {
                                 Authorization: `Bearer ${apiKey}`,
                                 'Content-Type': 'application/json'
                             },
-                            body: JSON.stringify(veoPayload)
+                            body: JSON.stringify(veoPayload),
+                            modelId,
+                            pollPathHint: endpoint,
+                            maxAttempts: 90,
+                            delayMs: 4000
                         });
-
-                        const text = await resp.text();
-
-                        if (!resp.ok) {
-                            console.error('Veo: 请求失败', { status: resp.status, text });
-                            throw new Error(text || `Veo error: ${resp.status} `);
+                        const videoUrl = data?.video_url || data?.url || data?.output || data?.data?.output;
+                        if (!videoUrl) {
+                            throw new Error('Veo 未返回视频地址');
                         }
-
-                        const data = JSON.parse(text);
-                        const jobId = data?.data?.id || data?.id || data?.task_id || data?.data?.task_id;
-
-                        if (!jobId) {
-                            console.error('Veo: 未找到 JobId', data);
-                            throw new Error('Veo No JobId');
+                        const endTime = Date.now();
+                        const historyItem = historyMap.get(taskId);
+                        const durationMs = endTime - (historyItem?.startTime || endTime);
+                        setHistory((prev) => prev.map((hItem) => hItem.id === taskId
+                            ? { ...hItem, status: 'completed', progress: 100, url: videoUrl, width: w, height: h, durationMs }
+                            : hItem
+                        ));
+                        const storyboardTask = storyboardTaskMapRef.current.get(taskId);
+                        if (storyboardTask) {
+                            updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                                video_url: videoUrl,
+                                status: 'done',
+                                durationCost: durationMs / 1000
+                            });
+                            storyboardTaskMapRef.current.delete(taskId);
+                        } else {
+                            if (historyItem?.sourceNodeId) {
+                                setTimeout(() => {
+                                    updatePreviewFromTask(taskId, videoUrl, 'video', historyItem.sourceNodeId);
+                                }, 0);
+                            }
                         }
-
-                        setHistory(prev => prev.map(h => h.id === taskId ? { ...h, status: 'generating', progress: 10 } : h));
-                        pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h);
                         return;
                     } catch (error) {
                         console.error('Veo: 请求发送失败', error);
@@ -17449,41 +17725,43 @@ function TapnowApp() {
 
                     // 4. 发送纯 JSON 请求
                     applyVideoCustomParams(payload);
-                    const resp = await fetch(endpoint, {
-                        method: 'POST',
+                    const data = await requestVideoGenerationViaBackend({
+                        targetUrl: endpoint,
+                        targetMethod: 'POST',
                         headers: {
                             'Authorization': `Bearer ${apiKey}`,
-                            'Content-Type': 'application/json' // 必须是 JSON
+                            'Content-Type': 'application/json'
                         },
-                        body: JSON.stringify(payload)
+                        body: JSON.stringify(payload),
+                        modelId,
+                        pollPathHint: endpoint,
+                        maxAttempts: 90,
+                        delayMs: 5000
                     });
-
-                    const text = await resp.text();
-
-                    // 5. 错误处理
-                    if (!resp.ok) {
-                        console.error('[Grok API Error]', text);
-                        throw new Error(text || `Grok API error: ${resp.status} `);
+                    const videoUrl = data?.video_url || data?.url || data?.output || data?.data?.output;
+                    if (!videoUrl) {
+                        throw new Error('API 未返回视频地址');
                     }
-
-                    // 6. 解析响应
-                    let data;
-                    try {
-                        data = JSON.parse(text);
-                    } catch (e) {
-                        throw new Error('API 返回了非 JSON 格式数据');
+                    const endTime = Date.now();
+                    const historyItem = historyMap.get(taskId);
+                    const durationMs = endTime - (historyItem?.startTime || endTime);
+                    setHistory((prev) => prev.map((hItem) => hItem.id === taskId
+                        ? { ...hItem, status: 'completed', progress: 100, url: videoUrl, width: w, height: h, durationMs }
+                        : hItem
+                    ));
+                    const storyboardTask = storyboardTaskMapRef.current.get(taskId);
+                    if (storyboardTask) {
+                        updateShot(storyboardTask.nodeId, storyboardTask.shotId, {
+                            video_url: videoUrl,
+                            status: 'done',
+                            durationCost: durationMs / 1000
+                        });
+                        storyboardTaskMapRef.current.delete(taskId);
+                    } else if (historyItem?.sourceNodeId) {
+                        setTimeout(() => {
+                            updatePreviewFromTask(taskId, videoUrl, 'video', historyItem.sourceNodeId);
+                        }, 0);
                     }
-
-                    // 兼容多种 ID 返回格式
-                    const jobId = data?.data?.id || data?.id || data?.task_id;
-                    if (!jobId) {
-                        console.error('Grok No Task ID:', data);
-                        throw new Error('API 未返回 Task ID');
-                    }
-
-                    // 7. 进入轮询 (Grok 兼容 Sora 查询接口)
-                    setHistory(prev => prev.map(h => h.id === taskId ? { ...h, status: 'generating', progress: 10, remoteTaskId: jobId } : h));
-                    pollSoraJob(jobId, taskId, baseUrl, apiKey, w, h, modelId);
 
                     return; // 阻断后续代码执行
                 }
@@ -17699,7 +17977,7 @@ function TapnowApp() {
                 }
 
                 let requestOverride = null;
-                if (requestTemplate?.enabled) {
+                if (requestTemplateEnabled) {
                     const buildRequestTemplateVars = async () => {
                         const vars = {
                             modelName: config?.modelName || modelId,
@@ -17880,11 +18158,23 @@ function TapnowApp() {
                     const cleanBaseUrl = baseUrl.replace(/\/+$/, '');
                     finalEndpoint = `${cleanBaseUrl}${finalEndpoint.startsWith('/') ? finalEndpoint : '/' + finalEndpoint}`;
                 }
+                if (import.meta.env.DEV) {
+                    console.info('[DEV][Video Request] finalEndpoint:', finalEndpoint, {
+                        model: modelId,
+                        method: overrideMethod
+                    });
+                }
 
-                const resp = await fetch(finalEndpoint, { method: overrideMethod, headers: overrideHeaders, body: requestBody });
-                const text = await resp.text();
-                if (!resp.ok) throw new Error(text || `Video API error: ${resp.status} `);
-                const data = JSON.parse(text);
+                const data = await requestVideoGenerationViaBackend({
+                    targetUrl: finalEndpoint,
+                    targetMethod: overrideMethod,
+                    headers: overrideHeaders,
+                    body: requestBody,
+                    modelId,
+                    pollPathHint: finalEndpoint,
+                    maxAttempts: modelId === 'sora-2-pro' ? 360 : 90,
+                    delayMs: modelId === 'sora-2-pro' ? 5000 : 4000
+                });
 
                 // V3.7.22: 使用精确匹配提取错误码，避免误判
                 const errorCode = data?.code || data?.data?.code;
@@ -17968,11 +18258,7 @@ function TapnowApp() {
                     });
                     return;
                 }
-                const jobId = data?.data?.id || data?.id || data?.task_id || data?.data?.task_id || data?.job_id || data?.data?.job_id;
-                if (!jobId) throw new Error(`No Task/Job ID returned. Response: ${JSON.stringify(data).substring(0, 200)}`);
-
-                if (modelId.includes('veo')) pollVeoJob(jobId, taskId, baseUrl, apiKey, w, h);
-                else pollSoraJob(jobId, taskId, baseUrl, apiKey, w, h, modelId);
+                throw new Error(`视频任务未返回结果地址，响应: ${JSON.stringify(data).substring(0, 200)}`);
             } // Close if (type === 'video')
         } catch (err) {
             // V3.5.12: If error has shouldRetry flag, recursively retry with new key
@@ -19064,10 +19350,67 @@ function TapnowApp() {
 
     const isAdminUser = !!currentUser?.is_admin;
 
+    const PROJECT_CACHE_PREFIX = 'tapnow_project_state_';
+    const getProjectCacheKey = useCallback((projectId) => {
+        if (!projectId) return '';
+        return `${PROJECT_CACHE_PREFIX}${projectId}`;
+    }, []);
+    const applyProjectState = useCallback((state, fallbackProjectName = '') => {
+        if (!state || typeof state !== 'object') return;
+        if (Array.isArray(state.nodes)) setNodes(state.nodes);
+        if (Array.isArray(state.connections)) setConnections(state.connections);
+        if (Array.isArray(state.history)) setHistory(state.history);
+        if (Array.isArray(state.chatSessions)) setChatSessions(state.chatSessions);
+        if (Array.isArray(state.characterLibrary)) setCharacterLibrary(state.characterLibrary);
+        setProjectName(state.projectName || fallbackProjectName || '未命名项目');
+    }, [setNodes, setConnections, setHistory, setChatSessions, setCharacterLibrary, setProjectName]);
+    const buildProjectStatePayload = useCallback(() => ({
+        nodes,
+        connections,
+        history,
+        chatSessions,
+        characterLibrary,
+        projectName,
+        savedAt: Date.now()
+    }), [nodes, connections, history, chatSessions, characterLibrary, projectName]);
+    const saveProjectStateToLocalCache = useCallback((projectId, state, meta = {}) => {
+        if (!projectId || !state) return;
+        try {
+            const payload = {
+                state,
+                cachedAt: Date.now(),
+                ...meta
+            };
+            localStorage.setItem(getProjectCacheKey(projectId), JSON.stringify(payload));
+        } catch (e) {
+            // ignore local cache write failures
+        }
+    }, [getProjectCacheKey]);
+    const readProjectStateFromLocalCache = useCallback((projectId) => {
+        if (!projectId) return null;
+        try {
+            const raw = localStorage.getItem(getProjectCacheKey(projectId));
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') return null;
+            if (!parsed.state || typeof parsed.state !== 'object') return null;
+            return parsed;
+        } catch (e) {
+            return null;
+        }
+    }, [getProjectCacheKey]);
+
     // Project management functions
     const handleSelectProject = useCallback(async (project) => {
         setCurrentProject(project);
         localStorage.setItem('tapnow_current_project', JSON.stringify(project));
+
+        const cachedProjectData = readProjectStateFromLocalCache(project?.id);
+        if (cachedProjectData?.state) {
+            applyProjectState(cachedProjectData.state, project?.name);
+            showToast(`已从本地缓存打开项目：${project.name}`, 'success');
+            return;
+        }
 
         // Load project state if available
         if (project?.id) {
@@ -19080,12 +19423,11 @@ function TapnowApp() {
                     const data = await res.json();
                     if (data.success && data.project?.current_state) {
                         const state = data.project.current_state;
-                        if (state.nodes) setNodes(state.nodes);
-                        if (state.connections) setConnections(state.connections);
-                        if (state.history) setHistory(state.history);
-                        if (state.chatSessions) setChatSessions(state.chatSessions);
-                        if (state.characterLibrary) setCharacterLibrary(state.characterLibrary);
-                        setProjectName(project.name);
+                        applyProjectState(state, project?.name);
+                        saveProjectStateToLocalCache(project.id, state, {
+                            source: 'server',
+                            serverUpdatedAt: data.project?.updated_at || null
+                        });
                         showToast(`已加载项目：${project.name}`, 'success');
                     }
                 }
@@ -19093,7 +19435,7 @@ function TapnowApp() {
                 showToast('加载项目状态失败', 'error');
             }
         }
-    }, [localServerUrl, buildLocalServerHeaders, setNodes, setConnections, setHistory, setChatSessions, setCharacterLibrary, setProjectName, showToast]);
+    }, [localServerUrl, buildLocalServerHeaders, applyProjectState, readProjectStateFromLocalCache, saveProjectStateToLocalCache, showToast]);
 
     const handleCreateProject = useCallback(async (project) => {
         setCurrentProject(project);
@@ -19116,18 +19458,13 @@ function TapnowApp() {
 
         setSaveStatus('saving');
         const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
+        const state = buildProjectStatePayload();
+
+        saveProjectStateToLocalCache(currentProject.id, state, {
+            source: 'local-before-server-save'
+        });
 
         try {
-            const state = {
-                nodes,
-                connections,
-                history,
-                chatSessions,
-                characterLibrary,
-                projectName,
-                savedAt: Date.now()
-            };
-
             const res = await fetch(`${baseUrl}/projects/${currentProject.id}`, {
                 method: 'POST',
                 headers: buildLocalServerHeaders({ 'Content-Type': 'application/json' }),
@@ -19137,6 +19474,10 @@ function TapnowApp() {
             if (res.ok) {
                 const data = await res.json();
                 if (data.success) {
+                    saveProjectStateToLocalCache(currentProject.id, state, {
+                        source: 'server-synced',
+                        serverUpdatedAt: data.project?.updated_at || Date.now()
+                    });
                     setSaveStatus('saved');
                     setTimeout(() => setSaveStatus('idle'), 2000);
                     return true;
@@ -19148,7 +19489,7 @@ function TapnowApp() {
             setSaveStatus('error');
             return false;
         }
-    }, [currentProject, currentUser, localServerUrl, buildLocalServerHeaders, nodes, connections, history, chatSessions, characterLibrary, projectName]);
+    }, [currentProject, currentUser, localServerUrl, buildLocalServerHeaders, buildProjectStatePayload, saveProjectStateToLocalCache]);
 
     const handleMainSave = useCallback(async () => {
         if (currentUser && currentProject?.id) {
@@ -19167,16 +19508,16 @@ function TapnowApp() {
         await handleSaveProject();
     }, [currentUser, currentProject, saveProjectToDatabase, showToast, handleSaveProject]);
 
-    // Auto-save effect
+    // Auto-save to local cache (server writes happen on explicit save only)
     useEffect(() => {
         if (!currentProject?.id || !currentUser) return;
-
-        const autoSave = setInterval(() => {
-            saveProjectToDatabase();
-        }, 30000); // Auto-save every 30 seconds
-
-        return () => clearInterval(autoSave);
-    }, [currentProject, currentUser, saveProjectToDatabase]);
+        const timer = setTimeout(() => {
+            saveProjectStateToLocalCache(currentProject.id, buildProjectStatePayload(), {
+                source: 'local-autosave'
+            });
+        }, 1200);
+        return () => clearTimeout(timer);
+    }, [currentProject, currentUser, nodes, connections, history, chatSessions, characterLibrary, projectName, buildProjectStatePayload, saveProjectStateToLocalCache]);
 
     // Check auth status on mount
     useEffect(() => {

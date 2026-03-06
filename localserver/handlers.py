@@ -10,6 +10,7 @@ import base64
 import mimetypes
 import urllib.request
 import http.client
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -65,7 +66,13 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
     def _send_cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, HEAD, PUT, DELETE')
-        self.send_header('Access-Control-Allow-Headers', '*')
+        request_headers = self.headers.get('Access-Control-Request-Headers', '')
+        allow_headers = 'Authorization, Content-Type, Accept, Origin, X-Requested-With'
+        if request_headers:
+            allow_headers = request_headers
+            if 'authorization' not in request_headers.lower():
+                allow_headers = f"{request_headers}, Authorization"
+        self.send_header('Access-Control-Allow-Headers', allow_headers)
         self.send_header('Access-Control-Expose-Headers', 'Content-Length, ETag, Last-Modified, Cache-Control')
 
     def _send_json(self, data, status=200):
@@ -146,6 +153,260 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
         ):
             if key in data:
                 config[key] = data[key]
+
+    def _normalize_api_config_payload(self, payload):
+        if not isinstance(payload, dict):
+            payload = {}
+        providers = payload.get('providers')
+        if not isinstance(providers, dict):
+            providers = {}
+        api_keys = payload.get('api_keys')
+        if not isinstance(api_keys, dict):
+            api_keys = {}
+
+        for provider_id, provider_key in api_keys.items():
+            if not provider_id:
+                continue
+            provider_cfg = providers.get(provider_id)
+            if not isinstance(provider_cfg, dict):
+                provider_cfg = {}
+            if provider_key and not provider_cfg.get('key'):
+                provider_cfg['key'] = provider_key
+            providers[provider_id] = provider_cfg
+
+        for provider_id, provider_cfg in providers.items():
+            if not isinstance(provider_cfg, dict):
+                continue
+            key_text = provider_cfg.get('key')
+            if isinstance(key_text, str) and key_text:
+                api_keys[provider_id] = key_text
+
+        payload['providers'] = providers
+        if api_keys:
+            payload['api_keys'] = api_keys
+        return payload
+
+    def _forward_http_request(self, method, target_url, headers=None, body=None):
+        parsed_target = urlparse(target_url)
+        if parsed_target.scheme not in ('http', 'https') or not parsed_target.hostname:
+            raise ValueError('非法目标URL')
+        if not is_proxy_target_allowed(target_url):
+            raise ValueError('目标域名不在允许列表')
+
+        path = parsed_target.path or '/'
+        if parsed_target.query:
+            path = f"{path}?{parsed_target.query}"
+
+        port = parsed_target.port or (443 if parsed_target.scheme == 'https' else 80)
+        conn_class = http.client.HTTPSConnection if parsed_target.scheme == 'https' else http.client.HTTPConnection
+        timeout_value = config.get("proxy_timeout", DEFAULT_PROXY_TIMEOUT)
+        timeout_value = None if timeout_value == 0 else timeout_value
+        conn = conn_class(parsed_target.hostname, port, timeout=timeout_value)
+        resp = None
+
+        req_headers = dict(headers or {})
+        if parsed_target.netloc:
+            req_headers['Host'] = parsed_target.netloc
+
+        try:
+            conn.request(method, path, body=body, headers=req_headers)
+            resp = conn.getresponse()
+            status = resp.status
+            reason = resp.reason
+            response_headers = resp.getheaders()
+            response_body = resp.read()
+            return status, reason, response_headers, response_body
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            conn.close()
+
+    def handle_video_generate(self, parsed):
+        target_url = (self.headers.get('X-Target-Url') or parse_qs(parsed.query or '').get('url', [''])[0]).strip()
+        if not target_url:
+            self._send_json({"success": False, "error": "缺少 X-Target-Url"}, 400)
+            return
+
+        target_method = (self.headers.get('X-Target-Method') or 'POST').strip().upper()
+        if target_method not in ('POST', 'PUT', 'PATCH'):
+            self._send_json({"success": False, "error": "X-Target-Method 仅支持 POST/PUT/PATCH"}, 400)
+            return
+
+        poll_path_hint = (self.headers.get('X-Poll-Path-Hint') or '').strip()
+        model_id = (self.headers.get('X-Model-Id') or '').strip().lower()
+        try:
+            max_attempts = int(self.headers.get('X-Poll-Max-Attempts') or 90)
+        except Exception:
+            max_attempts = 90
+        try:
+            delay_ms = int(self.headers.get('X-Poll-Delay-Ms') or 4000)
+        except Exception:
+            delay_ms = 4000
+        max_attempts = max(1, min(max_attempts, 720))
+        delay_ms = max(500, min(delay_ms, 30000))
+
+        content_length = int(self.headers.get('Content-Length', 0))
+        request_body = self.rfile.read(content_length) if content_length > 0 else None
+
+        submit_headers = {}
+        for key, value in self.headers.items():
+            lower = key.lower()
+            if lower in PROXY_SKIP_REQUEST_HEADERS:
+                continue
+            if lower in ('origin', 'referer'):
+                continue
+            if lower.startswith('x-target-') or lower.startswith('x-poll-'):
+                continue
+            submit_headers[key] = value
+
+        log_debug(
+            f"[VideoBackend][Submit] method={target_method} url={target_url} "
+            f"headers={preview_payload(redact_sensitive_headers(submit_headers), max_kb=4)} "
+            f"body={preview_payload(request_body, max_kb=8)}"
+        )
+
+        try:
+            submit_status, submit_reason, _, submit_body = self._forward_http_request(
+                target_method,
+                target_url,
+                headers=submit_headers,
+                body=request_body,
+            )
+        except Exception as exc:
+            self._send_json({"success": False, "error": f"提交任务失败: {exc}"}, 502)
+            return
+
+        submit_text = (submit_body or b'').decode('utf-8', errors='replace')
+        if submit_status < 200 or submit_status >= 300:
+            self._send_json({
+                "success": False,
+                "error": f"提交任务失败: HTTP {submit_status} {submit_reason}",
+                "upstream": preview_payload(submit_text, max_kb=8)
+            }, 502)
+            return
+
+        try:
+            submit_data = json.loads(submit_text or '{}')
+        except Exception:
+            self._send_json({"success": False, "error": "提交任务返回非 JSON"}, 502)
+            return
+
+        output_url = (
+            submit_data.get('video_url')
+            or submit_data.get('url')
+            or ((submit_data.get('data') or {}).get('video_url') if isinstance(submit_data.get('data'), dict) else None)
+            or ((submit_data.get('data') or {}).get('url') if isinstance(submit_data.get('data'), dict) else None)
+            or ((submit_data.get('data') or {}).get('output') if isinstance(submit_data.get('data'), dict) else None)
+            or submit_data.get('output')
+        )
+        if isinstance(output_url, str) and output_url.strip():
+            self._send_json({"success": True, "data": submit_data, "video_url": output_url.strip()})
+            return
+
+        job_id = (
+            ((submit_data.get('data') or {}).get('id') if isinstance(submit_data.get('data'), dict) else None)
+            or submit_data.get('id')
+            or submit_data.get('task_id')
+            or ((submit_data.get('data') or {}).get('task_id') if isinstance(submit_data.get('data'), dict) else None)
+            or submit_data.get('job_id')
+            or ((submit_data.get('data') or {}).get('job_id') if isinstance(submit_data.get('data'), dict) else None)
+        )
+        if not job_id:
+            self._send_json({"success": False, "error": "提交任务成功，但未返回 task/job id", "data": submit_data}, 502)
+            return
+
+        parsed_target = urlparse(target_url)
+        upstream_origin = f"{parsed_target.scheme}://{parsed_target.netloc}"
+        use_v2_poll = (
+            'grok' in model_id
+            or '/v2/videos/generations' in poll_path_hint
+            or (parsed_target.path or '').startswith('/v2/videos/generations')
+        )
+        poll_endpoint = '/v2/videos/generations' if use_v2_poll else '/v1/videos'
+        poll_url = f"{upstream_origin}{poll_endpoint}/{job_id}"
+
+        poll_headers = {}
+        auth_value = submit_headers.get('Authorization') or submit_headers.get('authorization')
+        if auth_value:
+            poll_headers['Authorization'] = auth_value
+        accept_value = submit_headers.get('Accept') or submit_headers.get('accept')
+        if accept_value:
+            poll_headers['Accept'] = accept_value
+
+        log_debug(
+            f"[VideoBackend][PollStart] job_id={job_id} poll_url={poll_url} "
+            f"max_attempts={max_attempts} delay_ms={delay_ms}"
+        )
+
+        for attempt in range(max_attempts):
+            try:
+                poll_status_code, poll_reason, _, poll_body = self._forward_http_request(
+                    'GET',
+                    poll_url,
+                    headers=poll_headers,
+                    body=None,
+                )
+            except Exception as exc:
+                if attempt >= max_attempts - 1:
+                    self._send_json({"success": False, "error": f"轮询失败: {exc}", "job_id": job_id}, 502)
+                    return
+                time.sleep(delay_ms / 1000.0)
+                continue
+
+            poll_text = (poll_body or b'').decode('utf-8', errors='replace')
+            if poll_status_code < 200 or poll_status_code >= 300:
+                if attempt >= max_attempts - 1:
+                    self._send_json({
+                        "success": False,
+                        "error": f"轮询失败: HTTP {poll_status_code} {poll_reason}",
+                        "job_id": job_id,
+                        "upstream": preview_payload(poll_text, max_kb=8)
+                    }, 502)
+                    return
+                time.sleep(delay_ms / 1000.0)
+                continue
+
+            try:
+                poll_data = json.loads(poll_text or '{}')
+            except Exception:
+                if attempt >= max_attempts - 1:
+                    self._send_json({"success": False, "error": "轮询返回非 JSON", "job_id": job_id}, 502)
+                    return
+                time.sleep(delay_ms / 1000.0)
+                continue
+
+            poll_output_url = (
+                ((poll_data.get('data') or {}).get('output') if isinstance(poll_data.get('data'), dict) else None)
+                or poll_data.get('output')
+                or ((poll_data.get('data') or {}).get('video_url') if isinstance(poll_data.get('data'), dict) else None)
+                or poll_data.get('video_url')
+                or ((poll_data.get('data') or {}).get('url') if isinstance(poll_data.get('data'), dict) else None)
+                or poll_data.get('url')
+            )
+            if isinstance(poll_output_url, str) and poll_output_url.strip():
+                self._send_json({"success": True, "data": poll_data, "video_url": poll_output_url.strip(), "job_id": job_id})
+                return
+
+            poll_status = (
+                ((poll_data.get('data') or {}).get('status') if isinstance(poll_data.get('data'), dict) else None)
+                or poll_data.get('status')
+                or ((poll_data.get('data') or {}).get('task_status') if isinstance(poll_data.get('data'), dict) else None)
+                or poll_data.get('task_status')
+            )
+            if str(poll_status or '').upper() in ('FAILED', 'ERROR', 'CANCELLED'):
+                self._send_json({
+                    "success": False,
+                    "error": f"任务失败: {poll_status}",
+                    "job_id": job_id,
+                    "data": poll_data
+                }, 502)
+                return
+
+            time.sleep(delay_ms / 1000.0)
+
+        self._send_json({"success": False, "error": "轮询超时", "job_id": job_id}, 504)
 
     # --- Router ---
 
@@ -402,6 +663,10 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             or path.startswith('/w/v1/webapp/task/openapi')
             or path.startswith('/task/openapi')) and FEATURES['comfy_middleware']:
             self.handle_comfy_post(path)
+            return
+
+        if path == '/video/generate':
+            self.handle_video_generate(parsed)
             return
 
         if path in ('/proxy', '/proxy/'):
@@ -1601,6 +1866,15 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             return
 
         method = self.command
+        target_path = parsed_target.path or '/'
+        is_video_poll = (
+            method == 'GET'
+            and (
+                target_path.startswith('/v1/videos/')
+                or target_path.startswith('/v2/videos/generations/')
+            )
+        )
+
         content_length = int(self.headers.get('Content-Length', 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
 
@@ -1620,8 +1894,13 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             f"headers={preview_payload(redact_sensitive_headers(forward_headers), max_kb=4)} "
             f"body={preview_payload(body, max_kb=8)}"
         )
+        if is_video_poll:
+            log_debug(
+                f"[Dev][VideoPoll][Request] target={target_url} "
+                f"auth={'yes' if bool(forward_headers.get('Authorization') or forward_headers.get('authorization')) else 'no'}"
+            )
 
-        path = parsed_target.path or '/'
+        path = target_path
         if parsed_target.query:
             path = f"{path}?{parsed_target.query}"
 
@@ -1694,6 +1973,12 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                 f"status={resp.status} content_type={content_type} "
                 f"body={preview_payload(preview_blob, max_kb=8)}{suffix}"
             )
+            if is_video_poll:
+                log_debug(
+                    f"[Dev][VideoPoll][Response] target={target_url} "
+                    f"status={resp.status} content_type={content_type} "
+                    f"preview={preview_payload(preview_blob, max_kb=2)}"
+                )
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
@@ -1713,12 +1998,9 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                 if not user:
                     return
                 api_config = db_manager.get_config('api_config') or api_config_manager._get_default_config()
-                self._send_json({
-                    "success": True,
-                    "data": api_config
-                })
-                return
-            api_config = api_config_manager.load_config()
+            else:
+                api_config = api_config_manager.load_config()
+            api_config = self._normalize_api_config_payload(api_config)
             self._send_json({
                 "success": True,
                 "data": api_config
@@ -1744,6 +2026,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             if action == 'update':
                 # 完全替换配置
                 config_data = body.get('config', {})
+                config_data = self._normalize_api_config_payload(config_data)
                 if db_manager.enabled:
                     db_manager.upsert_config('api_config', config_data, user.get('id') if user else None)
                     self._audit(user, 'api_config_update', 'system_config', 'api_config', {'action': action})

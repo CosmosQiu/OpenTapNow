@@ -21,7 +21,7 @@ from sqlalchemy import (
     String, Text, Integer, BigInteger, LargeBinary, func, text,
     ForeignKey, UniqueConstraint
 )
-from sqlalchemy.dialects.mysql import LONGBLOB
+from sqlalchemy.dialects.mysql import LONGBLOB, LONGTEXT
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql import select, and_
 
@@ -75,6 +75,7 @@ class DatabaseManager:
 
     def _init_tables(self):
         asset_blob_type = LargeBinary().with_variant(LONGBLOB(), "mysql")
+        long_text_type = Text().with_variant(LONGTEXT(), "mysql")
 
         self.users = Table(
             "users",
@@ -105,7 +106,7 @@ class DatabaseManager:
             Column("id", String(36), primary_key=True),
             Column("slug", String(128), nullable=False, unique=True),
             Column("name", String(255), nullable=False),
-            Column("current_state_json", Text, nullable=False, default="{}"),
+            Column("current_state_json", long_text_type, nullable=False, default="{}"),
             Column("state_version", BigInteger, nullable=False, default=0),
             Column("updated_by", String(36), nullable=True),
             Column("updated_at", BigInteger, nullable=False),
@@ -223,6 +224,20 @@ class DatabaseManager:
                 if data_type and data_type != "longblob":
                     conn.execute(text("ALTER TABLE assets MODIFY COLUMN content_blob LONGBLOB NOT NULL"))
                     print("[数据库] 已将 assets.content_blob 升级为 LONGBLOB")
+
+                row = conn.execute(text(
+                    """
+                    SELECT DATA_TYPE
+                    FROM INFORMATION_SCHEMA.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE()
+                      AND TABLE_NAME = 'projects'
+                      AND COLUMN_NAME = 'current_state_json'
+                    """
+                )).first()
+                data_type = ((row[0] if row else "") or "").lower()
+                if data_type and data_type != "longtext":
+                    conn.execute(text("ALTER TABLE projects MODIFY COLUMN current_state_json LONGTEXT NOT NULL"))
+                    print("[数据库] 已将 projects.current_state_json 升级为 LONGTEXT")
         except Exception as e:
             print(f"[数据库] 升级 assets.content_blob 失败: {e}")
 
