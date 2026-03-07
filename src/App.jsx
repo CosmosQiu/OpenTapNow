@@ -19860,15 +19860,36 @@ function TapnowApp() {
         };
         return transformProjectStateForCrossDevice(raw);
     }, [nodes, connections, history, chatSessions, characterLibrary, projectName, transformProjectStateForCrossDevice]);
+    const parseProjectStateTimestamp = useCallback((value) => {
+        if (typeof value === 'number' && Number.isFinite(value)) return value > 0 ? Math.floor(value) : 0;
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed) return 0;
+            const numeric = Number(trimmed);
+            if (Number.isFinite(numeric) && numeric > 0) return Math.floor(numeric);
+            const dateMs = Date.parse(trimmed);
+            if (Number.isFinite(dateMs) && dateMs > 0) return Math.floor(dateMs / 1000);
+        }
+        return 0;
+    }, []);
     const saveProjectStateToLocalCache = useCallback((projectId, state, meta = {}) => {
         if (!projectId || !state) return;
         try {
+            let existing = null;
+            const key = getProjectCacheKey(projectId);
+            try {
+                const raw = localStorage.getItem(key);
+                existing = raw ? JSON.parse(raw) : null;
+            } catch {
+                existing = null;
+            }
             const payload = {
+                ...(existing && typeof existing === 'object' ? existing : {}),
                 state,
                 cachedAt: Date.now(),
                 ...meta
             };
-            localStorage.setItem(getProjectCacheKey(projectId), JSON.stringify(payload));
+            localStorage.setItem(key, JSON.stringify(payload));
         } catch (e) {
             // ignore local cache write failures
         }
@@ -19892,40 +19913,74 @@ function TapnowApp() {
         setCurrentProject(project);
         localStorage.setItem('tapnow_current_project', JSON.stringify(project));
 
-        const cachedProjectData = readProjectStateFromLocalCache(project?.id);
-        if (cachedProjectData?.state) {
-            const normalizedState = transformProjectStateForCrossDevice(cachedProjectData.state);
-            applyProjectState(normalizedState, project?.name);
-            warmProjectMediaToLocalCache(normalizedState, project?.id).catch(() => { });
-            showToast(`已从本地缓存打开项目：${project.name}`, 'success');
-            return;
-        }
+        const projectId = project?.id;
+        const cachedProjectData = readProjectStateFromLocalCache(projectId);
+        const cachedState = cachedProjectData?.state && typeof cachedProjectData.state === 'object'
+            ? transformProjectStateForCrossDevice(cachedProjectData.state)
+            : null;
+        const cachedServerTs = parseProjectStateTimestamp(cachedProjectData?.serverUpdatedAt);
 
-        // Load project state if available
-        if (project?.id) {
+        let serverProject = null;
+        let serverState = null;
+        let serverTs = 0;
+        if (projectId) {
             const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
             try {
-                const res = await fetch(`${baseUrl}/projects/${project.id}`, {
+                const res = await fetch(`${baseUrl}/projects/${projectId}`, {
                     headers: buildLocalServerHeaders()
                 });
                 if (res.ok) {
                     const data = await res.json();
-                    if (data.success && data.project?.current_state) {
-                        const state = transformProjectStateForCrossDevice(data.project.current_state);
-                        applyProjectState(state, project?.name);
-                        saveProjectStateToLocalCache(project.id, state, {
-                            source: 'server',
-                            serverUpdatedAt: data.project?.updated_at || null
-                        });
-                        warmProjectMediaToLocalCache(state, project?.id).catch(() => { });
-                        showToast(`已加载项目：${project.name}`, 'success');
+                    if (data.success && data.project && typeof data.project === 'object') {
+                        serverProject = data.project;
+                        serverState = data.project.current_state && typeof data.project.current_state === 'object'
+                            ? transformProjectStateForCrossDevice(data.project.current_state)
+                            : null;
+                        serverTs = parseProjectStateTimestamp(data.project.state_updated_at ?? data.project.updated_at);
                     }
                 }
             } catch (e) {
-                showToast('加载项目状态失败', 'error');
+                // fallback to cache below
             }
         }
-    }, [localServerUrl, buildLocalServerHeaders, applyProjectState, readProjectStateFromLocalCache, saveProjectStateToLocalCache, showToast, transformProjectStateForCrossDevice, warmProjectMediaToLocalCache]);
+
+        const hasCachedState = !!cachedState;
+        const hasServerState = !!serverState;
+        const shouldUseServerState = hasServerState && (!hasCachedState || serverTs > cachedServerTs);
+
+        if (shouldUseServerState) {
+            applyProjectState(serverState, project?.name);
+            saveProjectStateToLocalCache(projectId, serverState, {
+                source: hasCachedState ? 'server-override-cache' : 'server',
+                serverUpdatedAt: serverProject?.state_updated_at ?? serverProject?.updated_at ?? null,
+                serverStateVersion: serverProject?.state_version ?? null
+            });
+            warmProjectMediaToLocalCache(serverState, projectId).catch(() => { });
+            showToast(hasCachedState ? `服务器版本较新，已覆盖本地缓存：${project.name}` : `已加载项目：${project.name}`, 'success');
+            return;
+        }
+
+        if (hasCachedState) {
+            applyProjectState(cachedState, project?.name);
+            warmProjectMediaToLocalCache(cachedState, projectId).catch(() => { });
+            showToast(`已从本地缓存打开项目：${project.name}`, 'success');
+            return;
+        }
+
+        if (hasServerState) {
+            applyProjectState(serverState, project?.name);
+            saveProjectStateToLocalCache(projectId, serverState, {
+                source: 'server',
+                serverUpdatedAt: serverProject?.state_updated_at ?? serverProject?.updated_at ?? null,
+                serverStateVersion: serverProject?.state_version ?? null
+            });
+            warmProjectMediaToLocalCache(serverState, projectId).catch(() => { });
+            showToast(`已加载项目：${project.name}`, 'success');
+            return;
+        }
+
+        showToast('加载项目状态失败', 'error');
+    }, [localServerUrl, buildLocalServerHeaders, applyProjectState, readProjectStateFromLocalCache, saveProjectStateToLocalCache, showToast, transformProjectStateForCrossDevice, warmProjectMediaToLocalCache, parseProjectStateTimestamp]);
 
     const handleCreateProject = useCallback(async (project) => {
         setCurrentProject(project);
@@ -19966,7 +20021,8 @@ function TapnowApp() {
                 if (data.success) {
                     saveProjectStateToLocalCache(currentProject.id, state, {
                         source: 'server-synced',
-                        serverUpdatedAt: data.project?.updated_at || Date.now()
+                        serverUpdatedAt: data.project?.state_updated_at ?? data.project?.updated_at ?? Date.now(),
+                        serverStateVersion: data.project?.state_version ?? null
                     });
                     setSaveStatus('saved');
                     setTimeout(() => setSaveStatus('idle'), 2000);

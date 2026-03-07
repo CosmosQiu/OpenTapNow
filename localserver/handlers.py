@@ -584,6 +584,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                             "state_version": row["state_version"],
                             "updated_by": row["updated_by"],
                             "updated_by_display_name": display_name,
+                            "state_updated_at": row["updated_at"],
                             "updated_at": row["updated_at"],
                             "created_at": row["created_at"],
                         })
@@ -634,6 +635,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                             "state_version": row["state_version"],
                             "updated_by": row["updated_by"],
                             "updated_by_display_name": display_name,
+                            "state_updated_at": row["updated_at"],
                             "updated_at": row["updated_at"],
                             "created_at": row["created_at"],
                         }
@@ -926,6 +928,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                                 "state_version": new_version,
                                 "updated_by": user.get('id') if user else None,
                                 "updated_by_display_name": (user.get('display_name') or user.get('username') or '') if user else '',
+                                "state_updated_at": now,
                                 "updated_at": now,
                             }
                         })
@@ -935,7 +938,6 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                         if 'name' in body:
                             updates['name'] = body['name']
                         if updates:
-                            updates['updated_at'] = int(time.time())
                             updates['updated_by'] = user.get('id') if user else None
                             conn.execute(
                                 db_manager.projects.update()
