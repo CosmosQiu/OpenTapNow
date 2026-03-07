@@ -157,6 +157,44 @@ export const ProjectModal = ({ isOpen, onClose, onSelectProject, onCreateProject
     const [newProjectName, setNewProjectName] = useState('');
     const [showCreateForm, setShowCreateForm] = useState(false);
     const [error, setError] = useState('');
+    const PROJECT_LIST_CACHE_TTL_MS = 2 * 60 * 1000;
+    const getProjectCacheKey = () => {
+        const baseUrl = localStorage.getItem('tapnow_local_server_url') || 'http://127.0.0.1:9527';
+        const userRaw = localStorage.getItem('tapnow_user') || '';
+        let userKey = 'anonymous';
+        try {
+            const user = userRaw ? JSON.parse(userRaw) : null;
+            userKey = user?.id || user?.username || 'anonymous';
+        } catch (e) {
+            userKey = 'anonymous';
+        }
+        return `tapnow_read_cache_v1:${baseUrl}:${userKey}:projects`;
+    };
+    const readCachedProjects = () => {
+        try {
+            const raw = localStorage.getItem(getProjectCacheKey());
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            const updatedAt = Number(parsed?.updatedAt || 0);
+            if (!Array.isArray(parsed?.value) || !Number.isFinite(updatedAt) || updatedAt <= 0) return null;
+            return {
+                value: parsed.value,
+                isStale: (Date.now() - updatedAt) > PROJECT_LIST_CACHE_TTL_MS,
+            };
+        } catch (e) {
+            return null;
+        }
+    };
+    const writeCachedProjects = (value) => {
+        try {
+            localStorage.setItem(getProjectCacheKey(), JSON.stringify({
+                updatedAt: Date.now(),
+                value: Array.isArray(value) ? value : []
+            }));
+        } catch (e) {
+            // ignore
+        }
+    };
 
     useEffect(() => {
         if (isOpen) {
@@ -166,6 +204,14 @@ export const ProjectModal = ({ isOpen, onClose, onSelectProject, onCreateProject
 
     const loadProjects = async () => {
         setLoading(true);
+        const cached = readCachedProjects();
+        if (cached?.value) {
+            setProjects(cached.value);
+            if (!cached.isStale) {
+                setLoading(false);
+                return;
+            }
+        }
         try {
             const baseUrl = localStorage.getItem('tapnow_local_server_url') || 'http://127.0.0.1:9527';
             const token = localStorage.getItem('tapnow_auth_token');
@@ -176,7 +222,9 @@ export const ProjectModal = ({ isOpen, onClose, onSelectProject, onCreateProject
             
             if (res.ok) {
                 const data = await res.json();
-                setProjects(data.projects || []);
+                const list = Array.isArray(data.projects) ? data.projects : [];
+                setProjects(list);
+                writeCachedProjects(list);
             }
         } catch (err) {
             console.error('加载项目失败:', err);
@@ -207,6 +255,7 @@ export const ProjectModal = ({ isOpen, onClose, onSelectProject, onCreateProject
                 const data = await res.json();
                 setNewProjectName('');
                 setShowCreateForm(false);
+                writeCachedProjects([]);
                 await loadProjects();
                 if (onCreateProject) onCreateProject(data.project);
             } else {
@@ -233,6 +282,7 @@ export const ProjectModal = ({ isOpen, onClose, onSelectProject, onCreateProject
             });
 
             if (res.ok) {
+                writeCachedProjects([]);
                 await loadProjects();
                 if (onDeleteProject) onDeleteProject(projectId);
             }

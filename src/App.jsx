@@ -4780,16 +4780,105 @@ function TapnowApp() {
             return '';
         }
     }, [localServerToken, localServerUsername, localServerPassword, currentUser]);
+    const LOCAL_READ_CACHE_PREFIX = 'tapnow_read_cache_v1';
+    const READ_CACHE_TTL_MS = {
+        authMe: 3 * 60 * 1000,
+        apiConfig: 10 * 60 * 1000,
+        recentVideoTasks: 45 * 1000,
+        listFiles: 3 * 60 * 1000,
+    };
+    const buildReadCacheKey = useCallback((scope) => {
+        const base = (localServerUrl || '').trim().replace(/\/+$/, '');
+        const userKey = currentUser?.id || currentUser?.username || 'anonymous';
+        return `${LOCAL_READ_CACHE_PREFIX}:${base}:${userKey}:${scope}`;
+    }, [localServerUrl, currentUser]);
+    const readCachedServerData = useCallback((scope, maxAgeMs = 0) => {
+        try {
+            const raw = localStorage.getItem(buildReadCacheKey(scope));
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object') return null;
+            const updatedAt = Number(parsed.updatedAt || 0);
+            if (!Number.isFinite(updatedAt) || updatedAt <= 0) return null;
+            const ageMs = Date.now() - updatedAt;
+            return {
+                value: parsed.value,
+                updatedAt,
+                isStale: maxAgeMs > 0 ? ageMs > maxAgeMs : false,
+            };
+        } catch {
+            return null;
+        }
+    }, [buildReadCacheKey]);
+    const writeCachedServerData = useCallback((scope, value) => {
+        try {
+            localStorage.setItem(buildReadCacheKey(scope), JSON.stringify({
+                updatedAt: Date.now(),
+                value,
+            }));
+        } catch {
+            // ignore cache write failures
+        }
+    }, [buildReadCacheKey]);
+    const clearCachedServerData = useCallback((scope) => {
+        try {
+            localStorage.removeItem(buildReadCacheKey(scope));
+        } catch {
+            // ignore cache remove failures
+        }
+    }, [buildReadCacheKey]);
+    const API_CONFIG_SERVER_TS_KEY = 'tapnow_api_config_server_updated_at';
     const configHydratedFromServerRef = useRef(false);
-    const configSyncTimerRef = useRef(null);
-    const buildApiConfigPersistPayload = useCallback(() => ({
+    const [apiConfigDirty, setApiConfigDirty] = useState(false);
+    const apiConfigSyncingRef = useRef(false);
+    const apiConfigLastSyncedSignatureRef = useRef('');
+    const parseServerConfigTimestamp = useCallback((value) => {
+        if (value === null || value === undefined || value === '') return 0;
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            return value > 1e12 ? value : value * 1000;
+        }
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (!trimmed) return 0;
+            const asNumber = Number(trimmed);
+            if (Number.isFinite(asNumber) && asNumber > 0) {
+                return asNumber > 1e12 ? asNumber : asNumber * 1000;
+            }
+            const parsed = Date.parse(trimmed);
+            return Number.isFinite(parsed) ? parsed : 0;
+        }
+        return 0;
+    }, []);
+    const buildApiConfigDraftPayload = useCallback(() => ({
         version: '2.0',
-        updated_at: new Date().toISOString(),
         global_api_key: globalApiKey || '',
         providers: providers || {},
         api_configs: Array.isArray(apiConfigs) ? apiConfigs : [],
         model_library: Array.isArray(modelLibrary) ? modelLibrary : []
     }), [globalApiKey, providers, apiConfigs, modelLibrary]);
+    const computeApiConfigSignature = useCallback((payload) => {
+        if (!payload || typeof payload !== 'object') return '';
+        try {
+            return JSON.stringify({
+                global_api_key: payload.global_api_key || '',
+                providers: payload.providers || {},
+                api_configs: Array.isArray(payload.api_configs) ? payload.api_configs : [],
+                model_library: Array.isArray(payload.model_library) ? payload.model_library : []
+            });
+        } catch {
+            return '';
+        }
+    }, []);
+    const buildApiConfigPersistPayload = useCallback(() => ({
+        ...buildApiConfigDraftPayload(),
+        updated_at: new Date().toISOString()
+    }), [buildApiConfigDraftPayload]);
+    useEffect(() => {
+        configHydratedFromServerRef.current = false;
+        apiConfigSyncingRef.current = false;
+        apiConfigLastSyncedSignatureRef.current = '';
+        setApiConfigDirty(false);
+    }, [currentUser?.id, localServerUrl]);
     useEffect(() => {
         if (configHydratedFromServerRef.current) return;
         if (!currentUser) return;
@@ -4797,28 +4886,20 @@ function TapnowApp() {
         if (!base) return;
         let cancelled = false;
         (async () => {
-            try {
-                const token = localServerToken || await ensureLocalServerAuth(base);
-                const headers = token ? { Authorization: `Bearer ${token}` } : buildLocalServerHeaders();
-                const resp = await fetch(`${base}/api-config`, { method: 'GET', headers });
-                if (!resp.ok) return;
-                const payload = await resp.json();
-                const data = payload?.data;
+            const applyRemoteConfigData = (data, serverUpdatedAtRaw = null) => {
                 if (!data || typeof data !== 'object') {
                     configHydratedFromServerRef.current = true;
                     return;
                 }
-                if (cancelled) return;
+                apiConfigSyncingRef.current = true;
                 if (typeof data.global_api_key === 'string') {
                     setGlobalApiKey(data.global_api_key);
                 }
                 if (data.providers && typeof data.providers === 'object' && !Array.isArray(data.providers)) {
                     const providerEntries = Object.entries(data.providers);
-                    if (providerEntries.length > 0) {
-                        setProviders(Object.fromEntries(providerEntries.map(([key, config]) => [key, normalizeProviderConfig(key, config)])));
-                    }
+                    setProviders(Object.fromEntries(providerEntries.map(([key, config]) => [key, normalizeProviderConfig(key, config)])));
                 }
-                if (Array.isArray(data.api_configs) && data.api_configs.length > 0) {
+                if (Array.isArray(data.api_configs)) {
                     const normalizedApiConfigs = data.api_configs
                         .map(config => ({
                             ...config,
@@ -4831,60 +4912,109 @@ function TapnowApp() {
                             _uid: config._uid || `uid-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
                         }))
                         .filter(c => c && !DELETED_MODEL_IDS.includes(c.id));
-                    if (normalizedApiConfigs.length > 0) {
-                        setApiConfigs(normalizedApiConfigs);
-                    }
+                    setApiConfigs(normalizedApiConfigs);
                 }
-                if (Array.isArray(data.model_library) && data.model_library.length > 0) {
+                if (Array.isArray(data.model_library)) {
                     const normalizedLibrary = data.model_library
                         .map((entry, idx) => normalizeModelLibraryEntry(entry, idx))
                         .filter(Boolean);
-                    if (normalizedLibrary.length > 0) {
-                        setModelLibrary(normalizedLibrary);
-                    }
+                    setModelLibrary(normalizedLibrary);
+                }
+                const nextSignature = computeApiConfigSignature(data);
+                apiConfigLastSyncedSignatureRef.current = nextSignature;
+                setApiConfigDirty(false);
+                const tsMs = parseServerConfigTimestamp(serverUpdatedAtRaw ?? data.updated_at);
+                if (tsMs > 0) {
+                    try {
+                        localStorage.setItem(API_CONFIG_SERVER_TS_KEY, String(tsMs));
+                    } catch { }
                 }
                 configHydratedFromServerRef.current = true;
+                setTimeout(() => {
+                    apiConfigSyncingRef.current = false;
+                }, 0);
+            };
+            try {
+                const token = localServerToken || await ensureLocalServerAuth(base);
+                const headers = token ? { Authorization: `Bearer ${token}` } : buildLocalServerHeaders();
+                const resp = await fetch(`${base}/api-config`, { method: 'GET', headers });
+                if (!resp.ok) return;
+                const payload = await resp.json();
+                const data = payload?.data;
+                if (cancelled) return;
+                if (data && typeof data === 'object') {
+                    const serverUpdatedAt = payload?.server_updated_at ?? data?.updated_at ?? null;
+                    writeCachedServerData('api-config', {
+                        data,
+                        server_updated_at: serverUpdatedAt
+                    });
+                    applyRemoteConfigData(data, serverUpdatedAt);
+                    return;
+                }
             } catch (e) {
-                // ignore and keep localStorage as fallback
+                // fallback to cached server snapshot
             }
+            if (cancelled) return;
+            const cached = readCachedServerData('api-config', READ_CACHE_TTL_MS.apiConfig);
+            const cachedPayload = cached?.value;
+            const cachedData = cachedPayload?.data || cachedPayload;
+            if (cachedData && typeof cachedData === 'object') {
+                applyRemoteConfigData(cachedData, cachedPayload?.server_updated_at ?? cachedData?.updated_at ?? null);
+                return;
+            }
+            configHydratedFromServerRef.current = true;
         })();
         return () => {
             cancelled = true;
         };
-    }, [currentUser, localServerUrl, localServerToken, ensureLocalServerAuth, buildLocalServerHeaders]);
+    }, [currentUser, localServerUrl, localServerToken, ensureLocalServerAuth, buildLocalServerHeaders, normalizeProviderConfig, normalizeModelLibraryEntry, readCachedServerData, writeCachedServerData, parseServerConfigTimestamp, computeApiConfigSignature]);
     useEffect(() => {
-        if (!currentUser) return;
         if (!configHydratedFromServerRef.current) return;
+        if (apiConfigSyncingRef.current) return;
+        const signature = computeApiConfigSignature(buildApiConfigDraftPayload());
+        const dirty = !!signature && signature !== apiConfigLastSyncedSignatureRef.current;
+        setApiConfigDirty(dirty);
+    }, [globalApiKey, providers, apiConfigs, modelLibrary, buildApiConfigDraftPayload, computeApiConfigSignature]);
+    const saveApiConfigToServer = useCallback(async () => {
+        if (!currentUser) return false;
         const base = (localServerUrl || '').replace(/\/+$/, '');
-        if (!base) return;
-        if (configSyncTimerRef.current) {
-            clearTimeout(configSyncTimerRef.current);
+        if (!base) return false;
+        const payload = buildApiConfigPersistPayload();
+        try {
+            const token = localServerToken || await ensureLocalServerAuth(base);
+            const headers = token
+                ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
+                : buildLocalServerHeaders({ 'Content-Type': 'application/json' });
+            const resp = await fetch(`${base}/api-config`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    action: 'update',
+                    config: payload
+                })
+            });
+            if (!resp.ok) return false;
+            const result = await resp.json();
+            if (result?.success !== true) return false;
+            const serverUpdatedAt = result?.server_updated_at ?? payload.updated_at;
+            const tsMs = parseServerConfigTimestamp(serverUpdatedAt);
+            if (tsMs > 0) {
+                try {
+                    localStorage.setItem(API_CONFIG_SERVER_TS_KEY, String(tsMs));
+                } catch { }
+            }
+            writeCachedServerData('api-config', {
+                data: payload,
+                server_updated_at: serverUpdatedAt
+            });
+            const signature = computeApiConfigSignature(payload);
+            apiConfigLastSyncedSignatureRef.current = signature;
+            setApiConfigDirty(false);
+            return true;
+        } catch (e) {
+            return false;
         }
-        configSyncTimerRef.current = setTimeout(async () => {
-            try {
-                const token = localServerToken || await ensureLocalServerAuth(base);
-                const headers = token
-                    ? { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }
-                    : buildLocalServerHeaders({ 'Content-Type': 'application/json' });
-                await fetch(`${base}/api-config`, {
-                    method: 'POST',
-                    headers,
-                    body: JSON.stringify({
-                        action: 'update',
-                        config: buildApiConfigPersistPayload()
-                    })
-                });
-            } catch (e) {
-                console.warn('[Config Sync] 保存到数据库失败，已保留本地配置');
-            }
-        }, 800);
-        return () => {
-            if (configSyncTimerRef.current) {
-                clearTimeout(configSyncTimerRef.current);
-                configSyncTimerRef.current = null;
-            }
-        };
-    }, [currentUser, localServerUrl, localServerToken, providers, apiConfigs, modelLibrary, globalApiKey, ensureLocalServerAuth, buildLocalServerHeaders, buildApiConfigPersistPayload]);
+    }, [currentUser, localServerUrl, localServerToken, ensureLocalServerAuth, buildLocalServerHeaders, buildApiConfigPersistPayload, parseServerConfigTimestamp, writeCachedServerData, computeApiConfigSignature]);
 
     // V2.6.1 Feature: 本地缓存服务器状态
     const [localCacheServerConnected, setLocalCacheServerConnected] = useState(false);
@@ -5120,13 +5250,8 @@ function TapnowApp() {
         const base = (localServerUrl || '').replace(/\/+$/, '');
         if (!base) return;
         const silent = options.silent === true;
-        try {
-            const res = await fetch(`${base}/list-files`);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            const files = Array.isArray(data?.files)
-                ? data.files
-                : (Array.isArray(data?.data?.files) ? data.data.files : []);
+        const forceRefresh = options.force === true;
+        const applyFileIndex = (files = []) => {
             const next = new Set();
             files.forEach((file) => {
                 const rel = normalizeLocalCacheRelPath(file?.rel_path || file?.relPath || file?.path || '');
@@ -5135,12 +5260,32 @@ function TapnowApp() {
             localCacheFileIndexRef.current = next;
             localCacheIndexReadyRef.current = true;
             setLocalCacheIndexTick((prev) => prev + 1);
+        };
+        if (!forceRefresh) {
+            const cached = readCachedServerData('list-files', READ_CACHE_TTL_MS.listFiles);
+            if (cached?.value && Array.isArray(cached.value)) {
+                applyFileIndex(cached.value);
+                if (!cached.isStale) {
+                    if (!silent) showToast('本地缓存索引已就绪（本地缓存）', 'success', 1200);
+                    return;
+                }
+            }
+        }
+        try {
+            const res = await fetch(`${base}/list-files`);
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            const files = Array.isArray(data?.files)
+                ? data.files
+                : (Array.isArray(data?.data?.files) ? data.data.files : []);
+            writeCachedServerData('list-files', files);
+            applyFileIndex(files);
             if (!silent) showToast('本地缓存索引已更新', 'success', 1500);
         } catch (e) {
             localCacheIndexReadyRef.current = false;
             if (!silent) showToast('本地缓存索引更新失败', 'warning', 1500);
         }
-    }, [localCacheActive, localServerUrl, normalizeLocalCacheRelPath, showToast]);
+    }, [localCacheActive, localServerUrl, normalizeLocalCacheRelPath, showToast, readCachedServerData, writeCachedServerData]);
 
     // 持久化性能模式和本地服务器设置
     useEffect(() => {
@@ -5321,6 +5466,41 @@ function TapnowApp() {
         }
         return next;
     };
+    const mapRecentVideoTaskToHistoryItem = useCallback((record) => {
+        const payload = record?.payload && typeof record.payload === 'object' ? record.payload : {};
+        const createdAtSec = Number(record?.created_at || 0);
+        const startTime = createdAtSec > 0 ? createdAtSec * 1000 : Date.now();
+        const remoteTaskId = String(record?.target_id || payload?.job_id || '').trim();
+        const videoUrl = String(payload?.video_url || payload?.output || payload?.url || '').trim();
+        const modelId = String(payload?.model_id || '').trim();
+        const action = String(record?.action || '').trim();
+        const isSuccess = action === 'video_generate_success' && !!videoUrl;
+        const isTimeout = action === 'video_generate_timeout';
+        const status = isSuccess ? 'completed' : 'failed';
+        const errorMsg = isSuccess ? null : (isTimeout ? '后端轮询超时' : '后端任务失败');
+        const timeLabel = new Date(startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+        return {
+            id: `remote-video-${record?.id || `${remoteTaskId}-${createdAtSec}`}`,
+            remoteAuditId: String(record?.id || ''),
+            type: 'video',
+            prompt: payload?.prompt || `视频任务 ${remoteTaskId || ''}`.trim(),
+            time: timeLabel,
+            status,
+            progress: status === 'completed' ? 100 : 0,
+            modelName: modelId || 'video',
+            url: videoUrl,
+            originalUrl: videoUrl,
+            mjOriginalUrl: videoUrl,
+            remoteTaskId: remoteTaskId || null,
+            provider: String(payload?.provider || '').trim(),
+            sourceNodeId: null,
+            startTime,
+            durationMs: null,
+            errorMsg,
+            backendSynced: true
+        };
+    }, []);
 
     const [history, setHistory] = useState(() => {
         try {
@@ -5611,6 +5791,106 @@ function TapnowApp() {
     const [historyQueuePanelOpen, setHistoryQueuePanelOpen] = useState(false);
     const [historyFocusIndex, setHistoryFocusIndex] = useState(-1); // V3.7.28: 历史列表键盘导航
     const [historyFocusId, setHistoryFocusId] = useState(null);
+    useEffect(() => {
+        if (!historyOpen) return;
+        if (!currentUser) return;
+        const base = (localServerUrl || '').replace(/\/+$/, '');
+        if (!base) return;
+
+        let cancelled = false;
+        (async () => {
+            const mergeRecentTasks = (items) => {
+                if (!Array.isArray(items) || items.length === 0 || cancelled) return;
+                setHistory((prev) => {
+                    const next = [...prev];
+                    const pendingInsert = [];
+                    let changed = false;
+
+                    items.forEach((record) => {
+                        const mapped = mapRecentVideoTaskToHistoryItem(record);
+                        if (!mapped.remoteAuditId) return;
+
+                        const auditIdx = next.findIndex((h) => h.remoteAuditId && h.remoteAuditId === mapped.remoteAuditId);
+                        if (auditIdx >= 0) return;
+
+                        if (mapped.remoteTaskId) {
+                            const existingTaskIdx = next.findIndex((h) => (
+                                h.type === 'video'
+                                && !h.remoteAuditId
+                                && String(h.remoteTaskId || '') === mapped.remoteTaskId
+                            ));
+                            if (existingTaskIdx >= 0) {
+                                const current = next[existingTaskIdx];
+                                next[existingTaskIdx] = {
+                                    ...current,
+                                    status: mapped.status,
+                                    progress: mapped.status === 'completed' ? 100 : (current.progress || 0),
+                                    url: mapped.url || current.url,
+                                    originalUrl: mapped.url || current.originalUrl || current.url,
+                                    mjOriginalUrl: mapped.url || current.mjOriginalUrl || current.originalUrl || current.url,
+                                    errorMsg: mapped.status === 'failed' ? (current.errorMsg || mapped.errorMsg) : null,
+                                    remoteAuditId: mapped.remoteAuditId,
+                                    backendSynced: true
+                                };
+                                changed = true;
+                                return;
+                            }
+                        }
+
+                        pendingInsert.push(mapped);
+                    });
+
+                    if (pendingInsert.length > 0) {
+                        changed = true;
+                        next.unshift(...pendingInsert);
+                    }
+                    if (!changed) return prev;
+                    return next.sort((a, b) => (b.startTime || 0) - (a.startTime || 0));
+                });
+            };
+
+            const cached = readCachedServerData('video-tasks-recent', READ_CACHE_TTL_MS.recentVideoTasks);
+            if (cached?.value && Array.isArray(cached.value)) {
+                mergeRecentTasks(cached.value);
+                if (!cached.isStale) {
+                    return;
+                }
+            }
+            try {
+                const token = localServerToken || await ensureLocalServerAuth(base);
+                const headers = token
+                    ? { Authorization: `Bearer ${token}` }
+                    : buildLocalServerHeaders();
+                const resp = await fetch(`${base}/video/tasks/recent?limit=80`, {
+                    method: 'GET',
+                    headers
+                });
+                if (!resp.ok || cancelled) return;
+                const payload = await resp.json();
+                const items = Array.isArray(payload?.items) ? payload.items : [];
+                writeCachedServerData('video-tasks-recent', items);
+                mergeRecentTasks(items);
+            } catch (e) {
+                if (import.meta.env.DEV) {
+                    console.warn('[DEV][History] 拉取后端视频任务记录失败:', e);
+                }
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [
+        historyOpen,
+        currentUser,
+        localServerUrl,
+        localServerToken,
+        ensureLocalServerAuth,
+        buildLocalServerHeaders,
+        mapRecentVideoTaskToHistoryItem,
+        readCachedServerData,
+        writeCachedServerData
+    ]);
     const [charactersOpen, setCharactersOpen] = useState(false);
     const [characterLibrary, setCharacterLibrary] = useState(() => {
         try {
@@ -8473,6 +8753,10 @@ function TapnowApp() {
         }
 
         const requestHeaders = { ...(headers || {}) };
+        const localToken = localServerToken || await ensureLocalServerAuth(base);
+        if (localToken) {
+            requestHeaders['X-Tapnow-Authorization'] = `Bearer ${localToken}`;
+        }
         requestHeaders['X-Target-Url'] = String(targetUrl);
         requestHeaders['X-Target-Method'] = String(targetMethod || 'POST').toUpperCase();
         if (modelId) requestHeaders['X-Model-Id'] = String(modelId);
@@ -8504,15 +8788,41 @@ function TapnowApp() {
         }
         if (payload && typeof payload === 'object' && payload.success === true) {
             const data = payload.data && typeof payload.data === 'object' ? { ...payload.data } : {};
-            const finalUrl = payload.video_url || data.video_url || data.url || data.output;
+            const finalUrl = payload.video_url || data.video_url || data.url || data.output || data?.data?.output || data?.data?.video_url || data?.data?.url;
+            const backendTaskIdRaw = payload.job_id || data.job_id || data.id || data?.data?.id || '';
+            const backendTaskId = String(backendTaskIdRaw || '').trim();
+            if (localToken && backendTaskId) {
+                try {
+                    const queryUrl = `${base}/video/tasks/recent?limit=1&task_id=${encodeURIComponent(backendTaskId)}`;
+                    const taskResp = await fetch(queryUrl, {
+                        method: 'GET',
+                        headers: {
+                            'X-Tapnow-Authorization': `Bearer ${localToken}`
+                        }
+                    });
+                    if (taskResp.ok) {
+                        const taskPayload = await taskResp.json();
+                        const firstItem = Array.isArray(taskPayload?.items) ? taskPayload.items[0] : null;
+                        const dbUrl = firstItem?.payload?.video_url || '';
+                        if (dbUrl && typeof dbUrl === 'string') {
+                            data.video_url = dbUrl;
+                            data.url = dbUrl;
+                            data.output = dbUrl;
+                        }
+                    }
+                } catch {
+                    // ignore DB readback failure and keep direct backend response as fallback
+                }
+            }
             if (finalUrl) {
                 if (!data.video_url) data.video_url = finalUrl;
                 if (!data.url) data.url = finalUrl;
+                if (!data.output) data.output = finalUrl;
             }
             return data;
         }
         return payload;
-    }, [localServerUrl]);
+    }, [localServerUrl, localServerToken, ensureLocalServerAuth]);
 
     const getModelLabel = useCallback((modelId) => {
         if (!modelId) return '选择模型';
@@ -16737,6 +17047,8 @@ function TapnowApp() {
                             : (sourceImage ? [sourceImage] : []);
                         const imageSources = await getTemplateImageSources(inputImages);
                         if (imageSources.length > 0) {
+                            vars.image = imageSources[0];
+                            vars.images = imageSources;
                             vars.imageUrl = imageSources[0];
                             vars.imageUrls = imageSources;
                             vars.imagesUrl = imageSources;
@@ -17594,6 +17906,18 @@ function TapnowApp() {
                         ...(aspectRatio ? { aspect_ratio: aspectRatio } : {})
                     };
                     applyVideoCustomParams(veoPayload);
+                    const hasImageInput = (effectiveConnectedImages?.length > 0 || !!effectiveSourceImage);
+                    if (hasImageInput && validImages.length > 0) {
+                        const payloadImages = Array.isArray(veoPayload.images) ? veoPayload.images : [];
+                        const inputImagesOverridden = (
+                            payloadImages.length !== validImages.length
+                            || payloadImages.some((img, idx) => img !== validImages[idx])
+                        );
+                        if (inputImagesOverridden) {
+                            console.warn('Veo: 自定义参数覆盖了输入图片，已回退到节点连接图片');
+                        }
+                        veoPayload.images = [...validImages];
+                    }
 
                     // 详细调试日志
                     console.log('Veo: 准备发送请求', {
@@ -17725,6 +18049,10 @@ function TapnowApp() {
 
                     // 4. 发送纯 JSON 请求
                     applyVideoCustomParams(payload);
+                    if (sourceImage && payload.images?.[0] !== base64Data) {
+                        console.warn('Grok: 自定义参数覆盖了输入图片，已回退到节点连接图片');
+                        payload.images = [base64Data];
+                    }
                     const data = await requestVideoGenerationViaBackend({
                         targetUrl: endpoint,
                         targetMethod: 'POST',
@@ -18023,6 +18351,8 @@ function TapnowApp() {
                         const firstFrameSource = startFrame || imageSources[0] || null;
                         const lastFrameSource = endFrame || imageSources[1] || null;
                         if (imageSources.length > 0) {
+                            vars.image = imageSources[0];
+                            vars.images = imageSources;
                             vars.imageUrl = imageSources[0];
                             vars.imageUrls = imageSources;
                             vars.imagesUrl = imageSources;
@@ -18223,7 +18553,7 @@ function TapnowApp() {
                 }
 
                 // V3.4.26: Support data.data array format (e.g., [{"url": "..."}])
-                const immediateUrl = data?.video_url || data?.url || data?.data?.video_url || data?.data?.url || (Array.isArray(data?.data) && data.data[0]?.url);
+                const immediateUrl = data?.video_url || data?.url || data?.output || data?.data?.output || data?.data?.video_url || data?.data?.url || (Array.isArray(data?.data) && data.data[0]?.url);
                 if (immediateUrl) {
                     const endTime = Date.now();
                     // 在更新 history 之前，先获取 sourceNodeId
@@ -19323,30 +19653,50 @@ function TapnowApp() {
         setLocalServerToken('');
         localStorage.removeItem('tapnow_user');
         localStorage.removeItem('tapnow_auth_token');
+        clearCachedServerData('auth-me');
         showToast('已退出登录', 'info');
-    }, [showToast, setLocalServerToken]);
+    }, [showToast, setLocalServerToken, clearCachedServerData]);
+
+    const isSameUserIdentity = useCallback((a, b) => {
+        if (!a || !b) return false;
+        const aId = a.id || '';
+        const bId = b.id || '';
+        const aName = a.username || '';
+        const bName = b.username || '';
+        const aAdmin = !!a.is_admin;
+        const bAdmin = !!b.is_admin;
+        return aId === bId && aName === bName && aAdmin === bAdmin;
+    }, []);
 
     const checkAuthStatus = useCallback(async () => {
         const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
         if (!baseUrl || !localServerToken) return;
+        const cached = readCachedServerData('auth-me', READ_CACHE_TTL_MS.authMe);
+        if (cached?.value && cached.value.success && cached.value.user) {
+            setCurrentUser((prev) => (isSameUserIdentity(prev, cached.value.user) ? prev : cached.value.user));
+            localStorage.setItem('tapnow_user', JSON.stringify(cached.value.user));
+            if (!cached.isStale) return;
+        }
         try {
             const res = await fetch(`${baseUrl}/auth/me`, {
                 headers: { 'Authorization': `Bearer ${localServerToken}` }
             });
             if (!res.ok) {
                 // Token expired or invalid
+                clearCachedServerData('auth-me');
                 handleLogout();
                 return;
             }
             const data = await res.json();
             if (data?.success && data?.user) {
-                setCurrentUser(data.user);
+                writeCachedServerData('auth-me', data);
+                setCurrentUser((prev) => (isSameUserIdentity(prev, data.user) ? prev : data.user));
                 localStorage.setItem('tapnow_user', JSON.stringify(data.user));
             }
         } catch (e) {
             // Server not available
         }
-    }, [localServerUrl, localServerToken, handleLogout]);
+    }, [localServerUrl, localServerToken, handleLogout, readCachedServerData, writeCachedServerData, clearCachedServerData, isSameUserIdentity]);
 
     const isAdminUser = !!currentUser?.is_admin;
 
@@ -19355,6 +19705,140 @@ function TapnowApp() {
         if (!projectId) return '';
         return `${PROJECT_CACHE_PREFIX}${projectId}`;
     }, []);
+    const looksLikeProjectMediaUrl = useCallback((value, keyHint = '') => {
+        if (!value || typeof value !== 'string') return false;
+        const raw = String(value).trim();
+        if (!raw) return false;
+        const key = String(keyHint || '').toLowerCase();
+        if (key === 'baseurl' || key === 'target_url' || key === 'poll_url' || key === 'endpoint') return false;
+        if (LocalImageManager.isImageId(raw)) return true;
+        if (raw.startsWith('asset://')) return true;
+        if (raw.startsWith('blob:')) return true;
+        if (/^data:(image|video)\//i.test(raw)) return true;
+        if (isLocalCacheUrl(raw)) return true;
+        if (!/^https?:\/\//i.test(raw)) return false;
+        if (isVideoUrl(raw)) return true;
+        if (/\.(png|jpe?g|webp|gif|bmp|svg|mp4|webm|mov|m4v|avi)([?#].*)?$/i.test(raw)) return true;
+        if (raw.includes('/file/') || raw.includes('/proxy?url=')) return true;
+        return false;
+    }, [isLocalCacheUrl]);
+    const normalizeProjectMediaUrlForSync = useCallback((value) => {
+        if (!value || typeof value !== 'string') return '';
+        const raw = String(value).trim();
+        if (!raw) return '';
+        if (LocalImageManager.isImageId(raw) || raw.startsWith('asset://') || /^data:(image|video)\//i.test(raw)) {
+            return raw;
+        }
+        if (raw.startsWith('blob:')) return '';
+        const resolved = resolveSourceReferenceUrl(raw) || raw;
+        if (!resolved || typeof resolved !== 'string') return '';
+        if (resolved.startsWith('blob:')) return '';
+        const sanitized = sanitizeHistoryUrlValue(resolved, '', { allowLocalCache: false }) || '';
+        if (sanitized) return sanitized;
+        if (!isLocalCacheUrl(resolved) && !String(resolved).includes('/proxy?url=')) return resolved;
+        return '';
+    }, [resolveSourceReferenceUrl, sanitizeHistoryUrlValue, isLocalCacheUrl]);
+    const transformProjectStateForCrossDevice = useCallback((state) => {
+        if (!state || typeof state !== 'object') return state;
+        const walk = (value, keyHint = '') => {
+            if (typeof value === 'string') {
+                if (!looksLikeProjectMediaUrl(value, keyHint)) return value;
+                const normalized = normalizeProjectMediaUrlForSync(value);
+                return normalized || value;
+            }
+            if (Array.isArray(value)) return value.map((item) => walk(item, keyHint));
+            if (!value || typeof value !== 'object') return value;
+            const next = {};
+            Object.entries(value).forEach(([key, val]) => {
+                if (key === 'localCacheUrl' || key === 'localFilePath') {
+                    next[key] = null;
+                    return;
+                }
+                if (key === 'localCacheMap') {
+                    next[key] = null;
+                    return;
+                }
+                next[key] = walk(val, key);
+            });
+            return next;
+        };
+        const next = {
+            ...state,
+            nodes: Array.isArray(state.nodes) ? state.nodes.map((node) => walk(node, 'node')) : state.nodes,
+            history: Array.isArray(state.history)
+                ? state.history.map((item) => {
+                    const sanitized = sanitizeHistoryItemForLoad(item || {});
+                    return walk(sanitized, 'history');
+                })
+                : state.history
+        };
+        return next;
+    }, [looksLikeProjectMediaUrl, normalizeProjectMediaUrlForSync, sanitizeHistoryItemForLoad]);
+    const warmProjectMediaToLocalCache = useCallback(async (state, projectId = '') => {
+        if (!localCacheActive) return;
+        if (!state || typeof state !== 'object') return;
+        const images = new Set();
+        const videos = new Set();
+        const addMediaUrl = (candidate, keyHint = '') => {
+            if (!candidate || typeof candidate !== 'string') return;
+            if (!looksLikeProjectMediaUrl(candidate, keyHint)) return;
+            const normalized = normalizeProjectMediaUrlForSync(candidate);
+            if (!normalized) return;
+            if (LocalImageManager.isImageId(normalized) || normalized.startsWith('asset://') || normalized.startsWith('blob:')) return;
+            if (isLocalCacheUrl(normalized) && isLocalCacheUrlAvailable(normalized)) return;
+            if (isVideoUrl(normalized) || /^data:video\//i.test(normalized)) {
+                videos.add(normalized);
+            } else {
+                images.add(normalized);
+            }
+        };
+        const traverseNode = (value, keyHint = '') => {
+            if (typeof value === 'string') {
+                addMediaUrl(value, keyHint);
+                return;
+            }
+            if (Array.isArray(value)) {
+                value.forEach((item) => traverseNode(item, keyHint));
+                return;
+            }
+            if (!value || typeof value !== 'object') return;
+            Object.entries(value).forEach(([key, val]) => traverseNode(val, key));
+        };
+        if (Array.isArray(state.history)) {
+            state.history.forEach((item) => {
+                if (!item || typeof item !== 'object') return;
+                addMediaUrl(item.url, 'url');
+                addMediaUrl(item.originalUrl, 'originalUrl');
+                addMediaUrl(item.mjOriginalUrl, 'mjOriginalUrl');
+                (Array.isArray(item.output_images) ? item.output_images : []).forEach((url) => addMediaUrl(url, 'output_images'));
+                (Array.isArray(item.mjImages) ? item.mjImages : []).forEach((url) => addMediaUrl(url, 'mjImages'));
+                addMediaUrl(item.thumbnailUrl, 'thumbnailUrl');
+                (Array.isArray(item.mjThumbnails) ? item.mjThumbnails : []).forEach((url) => addMediaUrl(url, 'mjThumbnails'));
+            });
+        }
+        if (Array.isArray(state.nodes)) {
+            state.nodes.forEach((node) => traverseNode(node, 'node'));
+        }
+        if (images.size === 0 && videos.size === 0) return;
+        let seq = 0;
+        for (const url of images) {
+            try {
+                const seed = `project-${projectId || 'default'}-img-${seq++}`;
+                await saveImageToLocalCache(seed, url, 'project_open');
+            } catch (e) {
+                // ignore warm-up errors
+            }
+        }
+        seq = 0;
+        for (const url of videos) {
+            try {
+                const seed = `project-${projectId || 'default'}-video-${seq++}`;
+                await saveVideoToLocalCache(seed, url, 'project_open');
+            } catch (e) {
+                // ignore warm-up errors
+            }
+        }
+    }, [localCacheActive, looksLikeProjectMediaUrl, normalizeProjectMediaUrlForSync, isLocalCacheUrl, isLocalCacheUrlAvailable, isVideoUrl, saveImageToLocalCache, saveVideoToLocalCache]);
     const applyProjectState = useCallback((state, fallbackProjectName = '') => {
         if (!state || typeof state !== 'object') return;
         if (Array.isArray(state.nodes)) setNodes(state.nodes);
@@ -19364,15 +19848,18 @@ function TapnowApp() {
         if (Array.isArray(state.characterLibrary)) setCharacterLibrary(state.characterLibrary);
         setProjectName(state.projectName || fallbackProjectName || '未命名项目');
     }, [setNodes, setConnections, setHistory, setChatSessions, setCharacterLibrary, setProjectName]);
-    const buildProjectStatePayload = useCallback(() => ({
-        nodes,
-        connections,
-        history,
-        chatSessions,
-        characterLibrary,
-        projectName,
-        savedAt: Date.now()
-    }), [nodes, connections, history, chatSessions, characterLibrary, projectName]);
+    const buildProjectStatePayload = useCallback(() => {
+        const raw = {
+            nodes,
+            connections,
+            history,
+            chatSessions,
+            characterLibrary,
+            projectName,
+            savedAt: Date.now()
+        };
+        return transformProjectStateForCrossDevice(raw);
+    }, [nodes, connections, history, chatSessions, characterLibrary, projectName, transformProjectStateForCrossDevice]);
     const saveProjectStateToLocalCache = useCallback((projectId, state, meta = {}) => {
         if (!projectId || !state) return;
         try {
@@ -19407,7 +19894,9 @@ function TapnowApp() {
 
         const cachedProjectData = readProjectStateFromLocalCache(project?.id);
         if (cachedProjectData?.state) {
-            applyProjectState(cachedProjectData.state, project?.name);
+            const normalizedState = transformProjectStateForCrossDevice(cachedProjectData.state);
+            applyProjectState(normalizedState, project?.name);
+            warmProjectMediaToLocalCache(normalizedState, project?.id).catch(() => { });
             showToast(`已从本地缓存打开项目：${project.name}`, 'success');
             return;
         }
@@ -19422,12 +19911,13 @@ function TapnowApp() {
                 if (res.ok) {
                     const data = await res.json();
                     if (data.success && data.project?.current_state) {
-                        const state = data.project.current_state;
+                        const state = transformProjectStateForCrossDevice(data.project.current_state);
                         applyProjectState(state, project?.name);
                         saveProjectStateToLocalCache(project.id, state, {
                             source: 'server',
                             serverUpdatedAt: data.project?.updated_at || null
                         });
+                        warmProjectMediaToLocalCache(state, project?.id).catch(() => { });
                         showToast(`已加载项目：${project.name}`, 'success');
                     }
                 }
@@ -19435,7 +19925,7 @@ function TapnowApp() {
                 showToast('加载项目状态失败', 'error');
             }
         }
-    }, [localServerUrl, buildLocalServerHeaders, applyProjectState, readProjectStateFromLocalCache, saveProjectStateToLocalCache, showToast]);
+    }, [localServerUrl, buildLocalServerHeaders, applyProjectState, readProjectStateFromLocalCache, saveProjectStateToLocalCache, showToast, transformProjectStateForCrossDevice, warmProjectMediaToLocalCache]);
 
     const handleCreateProject = useCallback(async (project) => {
         setCurrentProject(project);
@@ -26071,7 +26561,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                     onDrop={enableSmartDrop ? (e) => handleGenNodeDrop(node.id, e) : undefined}
                     onMouseDownCapture={(e) => {
                         if (e.button !== 0 || e.target === e.currentTarget) return;
-                        const interactive = e.target.closest('input, textarea, select, button, a, [contenteditable="true"]');
+                        const interactive = e.target.closest('input, textarea, select, button, a, video, audio, [contenteditable="true"], .tapnow-no-node-drag');
                         if (!interactive) return;
                         touchNodeSelectionPriority(node.id);
                         if (e.nativeEvent) e.nativeEvent.__tapnowSelectionHandled = true;
@@ -26102,6 +26592,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                     }}
                     onMouseDown={(e) => {
                         if (e.nativeEvent?.__tapnowSelectionHandled) return;
+                        if (e.target?.closest?.('video, audio, .tapnow-no-node-drag')) return;
                         if (e.button === 0) {
                             touchNodeSelectionPriority(node.id);
                             e.stopPropagation();
@@ -26342,7 +26833,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                 onDrop={enableSmartDrop ? (e) => handleGenNodeDrop(node.id, e) : undefined}
                 onMouseDownCapture={(e) => {
                     if (e.button !== 0 || e.target === e.currentTarget) return;
-                    const interactive = e.target.closest('input, textarea, select, button, a, [contenteditable="true"]');
+                    const interactive = e.target.closest('input, textarea, select, button, a, video, audio, [contenteditable="true"], .tapnow-no-node-drag');
                     if (!interactive) return;
                     touchNodeSelectionPriority(node.id);
                     if (e.nativeEvent) e.nativeEvent.__tapnowSelectionHandled = true;
@@ -26373,6 +26864,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                 }}
                 onMouseDown={(e) => {
                     if (e.nativeEvent?.__tapnowSelectionHandled) return;
+                    if (e.target?.closest?.('video, audio, .tapnow-no-node-drag')) return;
                     if (e.button === 0) {
                         touchNodeSelectionPriority(node.id);
                         e.stopPropagation();
@@ -27268,13 +27760,20 @@ ${inputText.substring(0, 15000)} ... (截断)
 
                                             {resolvedVideoUrl ? (
                                                 <div
-                                                    className="relative w-full aspect-video bg-black rounded-lg overflow-hidden cursor-pointer"
+                                                    className="tapnow-no-node-drag relative w-full aspect-video bg-black rounded-lg overflow-hidden cursor-pointer"
                                                     onDoubleClick={(e) => {
+                                                        const rect = e.currentTarget.getBoundingClientRect();
+                                                        const clickY = e.clientY - rect.top;
+                                                        const controlsZoneHeight = Math.max(52, Math.min(84, rect.height * 0.24));
+                                                        const isControlsZone = clickY >= (rect.height - controlsZoneHeight);
+                                                        if (isControlsZone) return;
                                                         e.preventDefault();
                                                         e.stopPropagation();
                                                         setLightboxItem({ id: `preview-video-${node.id}`, url: resolvedVideoUrl, type: 'video' });
                                                         setLightboxOpen(true);
                                                     }}
+                                                    onPointerDown={(e) => e.stopPropagation()}
+                                                    onClick={(e) => e.stopPropagation()}
                                                     onContextMenu={(e) => {
                                                         e.preventDefault();
                                                         e.stopPropagation();
@@ -27288,6 +27787,8 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                         controls
                                                         className="w-full h-full object-contain"
                                                         onMouseDown={(e) => e.stopPropagation()}
+                                                        onPointerDown={(e) => e.stopPropagation()}
+                                                        onClick={(e) => e.stopPropagation()}
                                                     />
                                                 </div>
                                             ) : (
@@ -32247,6 +32748,18 @@ ${inputText.substring(0, 15000)} ... (截断)
                     {
                         node.type === 'preview' && (
                             <div className="flex flex-col h-full pointer-events-auto">
+                                {(() => {
+                                    const previewPrimaryUrlRaw = node.content || (node.previewMjImages && node.previewMjImages[0]) || '';
+                                    const previewPrimaryUrl = previewPrimaryUrlRaw
+                                        ? resolveAssetChannelUrl(previewPrimaryUrlRaw)
+                                        : '';
+                                    const resolvedPreviewType = node.previewType || (isVideoUrl(previewPrimaryUrl) ? 'video' : 'image');
+                                    const previewDisplayUrl = previewPrimaryUrl || previewPrimaryUrlRaw;
+                                    const previewContentList = Array.isArray(node.previewMjImages)
+                                        ? node.previewMjImages.map((url) => resolveAssetChannelUrl(url) || url).filter(Boolean)
+                                        : null;
+                                    return (
+                                <>
                                 <div
                                     className={`flex items-center justify-between px-3 py-2 border-b text-xs font-semibold ${theme === 'dark'
                                         ? 'border-zinc-800 text-zinc-200'
@@ -32258,51 +32771,65 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         <span>{t('预览窗口')}</span>
                                     </div>
                                     <span className="text-[10px] text-zinc-500">
-                                        {node.previewType === 'video' ? '视频预览' : '图片预览'}
+                                        {resolvedPreviewType === 'video' ? '视频预览' : '图片预览'}
                                     </span>
                                 </div>
                                 <div className="flex-1 flex flex-col p-2 gap-2 min-h-0">
                                     <div
-                                        className={`relative flex-1 rounded-lg overflow-hidden flex items-center justify-center min-h-0 ${theme === 'dark'
+                                        className={`tapnow-no-node-drag relative flex-1 rounded-lg overflow-hidden flex items-center justify-center min-h-0 ${theme === 'dark'
                                             ? 'bg-zinc-900'
                                             : theme === 'solarized'
                                                 ? 'bg-[#fdf6e3]'
                                                 : 'bg-zinc-100'
                                             }`}
+                                        onMouseDown={(e) => e.stopPropagation()}
+                                        onPointerDown={(e) => e.stopPropagation()}
+                                        onClick={(e) => e.stopPropagation()}
                                         onDrop={(e) => handlePreviewDrop(node.id, e)}
                                         onDragOver={handleCanvasDragOver}
                                         onContextMenu={(e) => {
-                                            const previewUrl = node.content || (node.previewMjImages && node.previewMjImages[0]);
+                                            const previewUrl = previewDisplayUrl;
                                             if (previewUrl) {
-                                                handlePreviewRightClick(e, { url: previewUrl, type: node.previewType || (isVideoUrl(previewUrl) ? 'video' : 'image'), sourceNode: node });
+                                                handlePreviewRightClick(e, { url: previewUrl, type: resolvedPreviewType, sourceNode: node });
                                             }
                                         }}
                                         onDoubleClick={(e) => {
                                             e.stopPropagation();
                                             e.preventDefault();
-                                            const previewUrl = node.content || (node.previewMjImages && node.previewMjImages[0]);
+                                            const previewUrl = previewDisplayUrl;
+                                            if (previewUrl && resolvedPreviewType === 'video') {
+                                                const rect = e.currentTarget.getBoundingClientRect();
+                                                const clickY = e.clientY - rect.top;
+                                                const controlsZoneHeight = Math.max(52, Math.min(84, rect.height * 0.24));
+                                                const isControlsZone = clickY >= (rect.height - controlsZoneHeight);
+                                                if (isControlsZone) return;
+                                            }
                                             if (previewUrl) {
-                                                setLightboxItem({ url: previewUrl, type: node.previewType || (isVideoUrl(previewUrl) ? 'video' : 'image') });
+                                                setLightboxItem({ url: previewUrl, type: resolvedPreviewType });
                                             }
                                         }}
                                     >
-                                        {node.content || (node.previewMjImages && node.previewMjImages.length > 0) ? (
-                                            isVideoUrl(node.content) || node.previewType === 'video' ? (
+                                        {previewDisplayUrl || (previewContentList && previewContentList.length > 0) ? (
+                                            isVideoUrl(previewDisplayUrl) || resolvedPreviewType === 'video' ? (
                                                 <ResolvedVideo
-                                                    src={node.content}
-                                                    className={`w-full h-full object-contain ${theme === 'dark'
+                                                    src={previewDisplayUrl}
+                                                    onMouseDown={(e) => e.stopPropagation()}
+                                                    onPointerDown={(e) => e.stopPropagation()}
+                                                    onClick={(e) => e.stopPropagation()}
+                                                    controls
+                                                    draggable={false}
+                                                    playsInline
+                                                    className={`tapnow-no-node-drag w-full h-full object-contain ${theme === 'dark'
                                                         ? 'bg-black'
                                                         : theme === 'solarized'
                                                             ? 'bg-[#fdf6e3]'
                                                             : 'bg-zinc-100'
                                                         }`}
-                                                    controls
-                                                    draggable={false}
                                                 />
-                                            ) : node.previewMjImages && (node.previewMjImages.length === 4 || node.previewMjImages.length > 1) ? (
+                                            ) : previewContentList && (previewContentList.length === 4 || previewContentList.length > 1) ? (
                                                 // 多张图片网格显示（即梦回传的四张图）
-                                                <div className={`w-full h-full grid gap-0.5 p-0.5 ${node.previewMjImages.length === 4 ? 'grid-cols-2 grid-rows-2' : 'grid-cols-2'}`}>
-                                                    {node.previewMjImages.map((imgUrl, idx) => (
+                                                <div className={`w-full h-full grid gap-0.5 p-0.5 ${previewContentList.length === 4 ? 'grid-cols-2 grid-rows-2' : 'grid-cols-2'}`}>
+                                                    {previewContentList.map((imgUrl, idx) => (
                                                         <div
                                                             key={idx}
                                                             className={`relative w-full h-full overflow-hidden flex items-center justify-center group ${theme === 'dark'
@@ -32328,7 +32855,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                             ) : (
                                                 <div className="w-full h-full relative group/preview">
                                                     <LazyBase64Image
-                                                        src={node.content || (node.previewMjImages && node.previewMjImages[0])}
+                                                        src={previewDisplayUrl}
                                                         className={`w-full h-full object-contain ${theme === 'dark'
                                                             ? 'bg-black'
                                                             : theme === 'solarized'
@@ -32368,9 +32895,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 }`}
                                             onMouseDown={(e) => e.stopPropagation()}
                                             onClick={async () => {
-                                                if (!node.content) return;
+                                                if (!previewDisplayUrl) return;
                                                 try {
-                                                    await navigator.clipboard.writeText(node.content);
+                                                    await navigator.clipboard.writeText(previewDisplayUrl);
                                                 } catch { }
                                             }}
                                         >
@@ -32384,16 +32911,16 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 }`}
                                             onMouseDown={(e) => e.stopPropagation()}
                                             onClick={async () => {
-                                                if (!node.content) return;
+                                                if (!previewDisplayUrl) return;
                                                 const world = screenToWorld(node.x + node.width + 100, node.y + node.height / 2);
                                                 let dims;
-                                                if (!isVideoUrl(node.content)) {
+                                                if (!isVideoUrl(previewDisplayUrl)) {
                                                     try {
-                                                        const real = await getImageDimensions(node.content);
+                                                        const real = await getImageDimensions(previewDisplayUrl);
                                                         if (real?.w && real?.h) dims = { w: real.w, h: real.h };
                                                     } catch { }
                                                 }
-                                                addNode('input-image', world.x, world.y, null, node.content, dims);
+                                                addNode('input-image', world.x, world.y, null, previewDisplayUrl, dims);
                                             }}
                                         >
                                             <ArrowRightSquare size={13} />
@@ -32406,13 +32933,13 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                 }`}
                                             onMouseDown={(e) => e.stopPropagation()}
                                             onClick={() => {
-                                                if (!node.content) return;
+                                                if (!previewDisplayUrl) return;
                                                 const newFile = {
-                                                    name: node.previewType === 'video' ? 'Preview.mp4' : 'Preview.png',
-                                                    type: node.previewType === 'video' ? 'video/mp4' : 'image/png',
-                                                    content: node.content,
-                                                    isImage: node.previewType !== 'video',
-                                                    isVideo: node.previewType === 'video',
+                                                    name: resolvedPreviewType === 'video' ? 'Preview.mp4' : 'Preview.png',
+                                                    type: resolvedPreviewType === 'video' ? 'video/mp4' : 'image/png',
+                                                    content: previewDisplayUrl,
+                                                    isImage: resolvedPreviewType !== 'video',
+                                                    isVideo: resolvedPreviewType === 'video',
                                                     isAudio: false,
                                                     fromPreview: true
                                                 };
@@ -32425,6 +32952,9 @@ ${inputText.substring(0, 15000)} ... (截断)
                                         </button>
                                     </div>
                                 </div>
+                                </>
+                                );
+                                })()}
                             </div>
                         )
                     }
@@ -39407,20 +39937,29 @@ ${inputText.substring(0, 15000)} ... (截断)
                             <div className={`sticky bottom-0 pt-2 pb-2 px-1 flex justify-end gap-2 border-t mt-3 backdrop-blur-sm ${theme === 'dark' ? 'border-zinc-800 bg-zinc-950/90' : 'border-zinc-200 bg-white/95'}`}>
                                 <Button
                                     className="bg-blue-600 hover:bg-blue-500"
-                                    onClick={() => {
+                                    onClick={async () => {
                                         try {
                                             localStorage.setItem('tapnow_global_key', globalApiKey || '');
                                             localStorage.setItem('tapnow_providers', JSON.stringify(providers));
                                             localStorage.setItem('tapnow_api_configs', JSON.stringify(apiConfigs));
                                             localStorage.setItem('tapnow_model_library', JSON.stringify(modelLibrary));
                                             localStorage.setItem('tapnow_model_library_collapsed', JSON.stringify(Array.from(collapsedLibraryModels)));
-                                            showToast(t('配置已保存'), 'success', 1800);
+                                            if (currentUser) {
+                                                const ok = await saveApiConfigToServer();
+                                                if (ok) {
+                                                    showToast(t('配置已保存到服务器'), 'success', 1800);
+                                                } else {
+                                                    showToast(t('服务器保存失败，已保留本地配置'), 'error', 2200);
+                                                }
+                                            } else {
+                                                showToast(t('配置已保存'), 'success', 1800);
+                                            }
                                         } catch (e) {
                                             showToast(t('保存失败，请检查浏览器存储空间'), 'error', 2200);
                                         }
                                     }}
                                 >
-                                    {t('保存')}
+                                    {apiConfigDirty ? t('保存（有改动）') : t('保存')}
                                 </Button>
                                 <Button variant="secondary" onClick={() => setSettingsOpen(false)}>{t('关闭')}</Button>
                             </div>

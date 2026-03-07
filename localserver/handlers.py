@@ -96,7 +96,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             return None
 
     def _extract_bearer_token(self):
-        auth = self.headers.get('Authorization', '') or ''
+        auth = self.headers.get('X-Tapnow-Authorization', '') or self.headers.get('Authorization', '') or ''
         if not auth.startswith('Bearer '):
             return ''
         return auth[7:].strip()
@@ -224,6 +224,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             conn.close()
 
     def handle_video_generate(self, parsed):
+        user = self._get_current_user() if db_manager.enabled else None
         target_url = (self.headers.get('X-Target-Url') or parse_qs(parsed.query or '').get('url', [''])[0]).strip()
         if not target_url:
             self._send_json({"success": False, "error": "缺少 X-Target-Url"}, 400)
@@ -302,6 +303,13 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             or submit_data.get('output')
         )
         if isinstance(output_url, str) and output_url.strip():
+            self._audit(user, 'video_generate_success', 'video_job', str(submit_data.get('id') or ''), {
+                'source': 'submit_response',
+                'target_url': target_url,
+                'video_url': output_url.strip(),
+                'poll_path_hint': poll_path_hint,
+                'model_id': model_id,
+            })
             self._send_json({"success": True, "data": submit_data, "video_url": output_url.strip()})
             return
 
@@ -386,6 +394,15 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                 or poll_data.get('url')
             )
             if isinstance(poll_output_url, str) and poll_output_url.strip():
+                self._audit(user, 'video_generate_success', 'video_job', str(job_id), {
+                    'source': 'poll_response',
+                    'target_url': target_url,
+                    'poll_url': poll_url,
+                    'attempt': attempt + 1,
+                    'video_url': poll_output_url.strip(),
+                    'poll_path_hint': poll_path_hint,
+                    'model_id': model_id,
+                })
                 self._send_json({"success": True, "data": poll_data, "video_url": poll_output_url.strip(), "job_id": job_id})
                 return
 
@@ -396,6 +413,14 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                 or poll_data.get('task_status')
             )
             if str(poll_status or '').upper() in ('FAILED', 'ERROR', 'CANCELLED'):
+                self._audit(user, 'video_generate_failed', 'video_job', str(job_id), {
+                    'target_url': target_url,
+                    'poll_url': poll_url,
+                    'attempt': attempt + 1,
+                    'status': str(poll_status),
+                    'poll_path_hint': poll_path_hint,
+                    'model_id': model_id,
+                })
                 self._send_json({
                     "success": False,
                     "error": f"任务失败: {poll_status}",
@@ -406,7 +431,38 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
 
             time.sleep(delay_ms / 1000.0)
 
+        self._audit(user, 'video_generate_timeout', 'video_job', str(job_id), {
+            'target_url': target_url,
+            'poll_url': poll_url,
+            'max_attempts': max_attempts,
+            'delay_ms': delay_ms,
+            'poll_path_hint': poll_path_hint,
+            'model_id': model_id,
+        })
         self._send_json({"success": False, "error": "轮询超时", "job_id": job_id}, 504)
+
+    def handle_get_recent_video_tasks(self, parsed):
+        try:
+            if not db_manager.enabled:
+                self._send_json({"success": True, "items": []})
+                return
+
+            user = self._require_user()
+            if not user:
+                return
+
+            params = parse_qs(parsed.query or '')
+            try:
+                limit = int(params.get('limit', ['50'])[0])
+            except Exception:
+                limit = 50
+            limit = max(1, min(limit, 200))
+            task_id = str(params.get('task_id', [''])[0] or '').strip()
+
+            items = db_manager.list_recent_video_tasks(limit=limit, target_id=task_id)
+            self._send_json({"success": True, "items": items})
+        except Exception as e:
+            self._send_json({"success": False, "error": str(e)}, 500)
 
     # --- Router ---
 
@@ -430,6 +486,10 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
         # 2. 原有功能路由
         if path in ('/proxy', '/proxy/'):
             self.handle_proxy(parsed)
+            return
+
+        if path == '/video/tasks/recent':
+            self.handle_get_recent_video_tasks(parsed)
             return
 
         if path == '/status' or path == '/ping':
@@ -1993,17 +2053,27 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
     def handle_get_api_config(self):
         """获取API配置"""
         try:
+            server_updated_at = None
             if db_manager.enabled:
                 user = self._require_user()
                 if not user:
                     return
-                api_config = db_manager.get_config('api_config') or api_config_manager._get_default_config()
+                config_row = db_manager.get_config_with_meta('api_config')
+                api_config = (config_row or {}).get('value') or api_config_manager._get_default_config()
+                server_updated_at = (config_row or {}).get('updated_at')
             else:
                 api_config = api_config_manager.load_config()
+                if isinstance(api_config, dict):
+                    server_updated_at = api_config.get('updated_at')
             api_config = self._normalize_api_config_payload(api_config)
+            if isinstance(api_config, dict):
+                payload_updated_at = api_config.get('updated_at')
+                if payload_updated_at is not None:
+                    server_updated_at = payload_updated_at
             self._send_json({
                 "success": True,
-                "data": api_config
+                "data": api_config,
+                "server_updated_at": server_updated_at
             })
         except Exception as e:
             log(f"获取API配置失败: {e}")
@@ -2029,17 +2099,20 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                 config_data = self._normalize_api_config_payload(config_data)
                 if db_manager.enabled:
                     db_manager.upsert_config('api_config', config_data, user.get('id') if user else None)
+                    row = db_manager.get_config_with_meta('api_config')
                     self._audit(user, 'api_config_update', 'system_config', 'api_config', {'action': action})
                     self._send_json({
                         "success": True,
-                        "message": "配置已保存"
+                        "message": "配置已保存",
+                        "server_updated_at": (row or {}).get('updated_at')
                     })
                     return
                 api_config_manager.save_config(config_data)
                 log("API配置已更新")
                 self._send_json({
                     "success": True,
-                    "message": "配置已保存"
+                    "message": "配置已保存",
+                    "server_updated_at": config_data.get('updated_at') if isinstance(config_data, dict) else None
                 })
 
             elif action == 'update_provider':

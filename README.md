@@ -264,6 +264,63 @@ python localserver/server.py -p 8080 -d ./data --static-dir ./dist
 - `9527` - Python 后端服务（本地开发）
 - `3306` - MySQL 数据库（Docker 模式）
 
+## 视频任务历史接口（只读）
+
+用于把后端数据库中的视频生成审计记录返回给前端历史面板，避免仅依赖本地历史。
+
+### Endpoint
+
+- `GET /video/tasks/recent`
+
+### 鉴权
+
+- 需要已登录用户。
+- 请求头可使用：
+  - `X-Tapnow-Authorization: Bearer <token>`（推荐）
+  - 或 `Authorization: Bearer <token>`
+
+### Query 参数
+
+- `limit`（可选，默认 `50`，范围 `1..200`）
+- `task_id`（可选，按后端任务 ID 精确筛选；对应审计日志中的 `target_id`）
+
+### 返回示例
+
+```json
+{
+  "success": true,
+  "items": [
+    {
+      "id": "audit-log-id",
+      "action": "video_generate_success",
+      "target_id": "job-id",
+      "created_at": 1730000000,
+      "actor_user_id": "user-id",
+      "payload": {
+        "video_url": "https://.../result.mp4",
+        "model_id": "sora-2",
+        "target_url": "https://api.openai.com/v1/videos/generations"
+      }
+    }
+  ]
+}
+```
+
+### 记录范围
+
+- `target_type = video_job`
+- `action in [video_generate_success, video_generate_failed, video_generate_timeout]`
+- 按 `created_at desc` 返回。
+
+### DB 关闭时行为
+
+- 安全降级：返回 `{"success": true, "items": []}`。
+
+### 前端使用说明
+
+- 历史面板打开时会请求 `GET /video/tasks/recent?limit=80`，并与本地历史合并，不覆盖本地记录。
+- 视频生成成功后，前端会基于 `task_id` 再读取一次后端记录（`limit=1&task_id=<job_id>`），优先使用 DB 里记录的 `payload.video_url`。
+
 ## 云服务器部署
 
 ```bash

@@ -549,6 +549,22 @@ class DatabaseManager:
             except Exception:
                 return None
 
+    def get_config_with_meta(self, key: str) -> Optional[Dict[str, Any]]:
+        with self.connection() as conn:
+            row = conn.execute(select(self.system_configs).where(self.system_configs.c.config_key == key)).mappings().first()
+            if not row:
+                return None
+            payload: Dict[str, Any] = {}
+            try:
+                payload = json.loads(row["config_value_json"] or "{}")
+            except Exception:
+                payload = {}
+            return {
+                "value": payload,
+                "updated_at": row.get("updated_at"),
+                "updated_by": row.get("updated_by"),
+            }
+
     def save_workflow_version(
         self,
         *,
@@ -652,6 +668,49 @@ class DatabaseManager:
                 payload_json=json.dumps(payload or {}, ensure_ascii=False),
                 created_at=_now_ts(),
             ))
+
+    def list_recent_video_tasks(self, *, limit: int = 50, target_id: str = "") -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+        safe_limit = max(1, min(int(limit or 50), 200))
+        normalized_target_id = str(target_id or '').strip()
+        where_clause = and_(
+            self.audit_logs.c.target_type == 'video_job',
+            self.audit_logs.c.action.in_([
+                'video_generate_success',
+                'video_generate_failed',
+                'video_generate_timeout'
+            ])
+        )
+        if normalized_target_id:
+            where_clause = and_(
+                where_clause,
+                self.audit_logs.c.target_id == normalized_target_id
+            )
+        with self.connection() as conn:
+            rows = conn.execute(
+                select(self.audit_logs)
+                .where(where_clause)
+                .order_by(self.audit_logs.c.created_at.desc())
+                .limit(safe_limit)
+            ).mappings().all()
+
+        result = []
+        for row in rows:
+            payload = {}
+            try:
+                payload = json.loads(row.get('payload_json') or '{}')
+            except Exception:
+                payload = {}
+            result.append({
+                'id': row.get('id'),
+                'action': row.get('action'),
+                'target_id': row.get('target_id') or '',
+                'created_at': row.get('created_at') or 0,
+                'actor_user_id': row.get('actor_user_id') or '',
+                'payload': payload,
+            })
+        return result
 
 
 db_manager = DatabaseManager()
