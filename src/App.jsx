@@ -5504,9 +5504,28 @@ function TapnowApp() {
 
     const [history, setHistory] = useState(() => {
         try {
-            const saved = localStorage.getItem('tapnow_history');
-            if (!saved) return [];
-            const parsed = JSON.parse(saved);
+            let activeProjectId = '';
+            try {
+                const rawProject = localStorage.getItem('tapnow_current_project');
+                if (rawProject) {
+                    const parsedProject = JSON.parse(rawProject);
+                    activeProjectId = String(parsedProject?.id || '').trim();
+                }
+            } catch { }
+            const candidateKeys = activeProjectId
+                ? [`tapnow_project_history_${activeProjectId}`, 'tapnow_history']
+                : ['tapnow_history'];
+            let parsed = [];
+            for (const key of candidateKeys) {
+                const saved = localStorage.getItem(key);
+                if (!saved) continue;
+                const data = JSON.parse(saved);
+                if (Array.isArray(data)) {
+                    parsed = data;
+                    break;
+                }
+            }
+            if (!Array.isArray(parsed) || parsed.length === 0) return [];
             // 检查是否有需要重新切割的Midjourney图片 + 修复 blob/asset 残留
             return parsed.map(item => {
                 const sanitized = sanitizeHistoryItemForLoad(item);
@@ -5791,6 +5810,15 @@ function TapnowApp() {
     const [historyQueuePanelOpen, setHistoryQueuePanelOpen] = useState(false);
     const [historyFocusIndex, setHistoryFocusIndex] = useState(-1); // V3.7.28: 历史列表键盘导航
     const [historyFocusId, setHistoryFocusId] = useState(null);
+    const getHistoryStorageKey = useCallback((projectId = '') => {
+        const id = String(projectId || '').trim();
+        return id ? `tapnow_project_history_${id}` : 'tapnow_history';
+    }, []);
+    const writeHistorySnapshotToStorage = useCallback((historyToSave) => {
+        if (!Array.isArray(historyToSave)) return;
+        const key = getHistoryStorageKey(currentProject?.id);
+        localStorage.setItem(key, JSON.stringify(historyToSave));
+    }, [getHistoryStorageKey, currentProject]);
     useEffect(() => {
         if (!historyOpen) return;
         if (!currentUser) return;
@@ -5799,6 +5827,8 @@ function TapnowApp() {
 
         let cancelled = false;
         (async () => {
+            const projectScopeId = String(currentProject?.id || '').trim();
+            const recentCacheKey = projectScopeId ? `video-tasks-recent:${projectScopeId}` : 'video-tasks-recent';
             const mergeRecentTasks = (items) => {
                 if (!Array.isArray(items) || items.length === 0 || cancelled) return;
                 setHistory((prev) => {
@@ -5849,7 +5879,7 @@ function TapnowApp() {
                 });
             };
 
-            const cached = readCachedServerData('video-tasks-recent', READ_CACHE_TTL_MS.recentVideoTasks);
+            const cached = readCachedServerData(recentCacheKey, READ_CACHE_TTL_MS.recentVideoTasks);
             if (cached?.value && Array.isArray(cached.value)) {
                 mergeRecentTasks(cached.value);
                 if (!cached.isStale) {
@@ -5861,14 +5891,16 @@ function TapnowApp() {
                 const headers = token
                     ? { Authorization: `Bearer ${token}` }
                     : buildLocalServerHeaders();
-                const resp = await fetch(`${base}/video/tasks/recent?limit=80`, {
+                const query = new URLSearchParams({ limit: '80' });
+                if (projectScopeId) query.set('project_id', projectScopeId);
+                const resp = await fetch(`${base}/video/tasks/recent?${query.toString()}`, {
                     method: 'GET',
                     headers
                 });
                 if (!resp.ok || cancelled) return;
                 const payload = await resp.json();
                 const items = Array.isArray(payload?.items) ? payload.items : [];
-                writeCachedServerData('video-tasks-recent', items);
+                writeCachedServerData(recentCacheKey, items);
                 mergeRecentTasks(items);
             } catch (e) {
                 if (import.meta.env.DEV) {
@@ -5883,6 +5915,7 @@ function TapnowApp() {
     }, [
         historyOpen,
         currentUser,
+        currentProject,
         localServerUrl,
         localServerToken,
         ensureLocalServerAuth,
@@ -8265,7 +8298,7 @@ function TapnowApp() {
     // localStorage 写入防抖函数
     const debouncedSaveHistory = useMemo(() => debounce((historyToSave) => {
         try {
-            localStorage.setItem('tapnow_history', JSON.stringify(historyToSave));
+            writeHistorySnapshotToStorage(historyToSave);
         } catch (e) {
             console.error('保存历史记录失败（可能超出存储配额）:', e);
             // 如果存储失败，尝试减少数据量
@@ -8286,7 +8319,7 @@ function TapnowApp() {
                     mjRatio: item.mjRatio,
                     mjNeedsSplit: item.mjNeedsSplit
                 }));
-                localStorage.setItem('tapnow_history', JSON.stringify(reduced));
+                writeHistorySnapshotToStorage(reduced);
             } catch (e2) {
                 console.error('减少数据后保存也失败:', e2);
                 try {
@@ -8306,14 +8339,14 @@ function TapnowApp() {
                 }
             }
         }
-    }, 1000), []);
+    }, 1000), [writeHistorySnapshotToStorage]);
 
     const persistHistorySnapshot = (historyItems = []) => {
         try {
             const historyToSave = historyItems
                 .slice(0, historyLimit)
                 .map((item) => compactHistoryItemForStorage(item));
-            localStorage.setItem('tapnow_history', JSON.stringify(historyToSave));
+            writeHistorySnapshotToStorage(historyToSave);
             return true;
         } catch (e) {
             console.error('立即保存历史记录失败:', e);
@@ -8335,7 +8368,7 @@ function TapnowApp() {
                     mjRatio: item.mjRatio,
                     mjNeedsSplit: item.mjNeedsSplit
                 }));
-                localStorage.setItem('tapnow_history', JSON.stringify(reduced));
+                writeHistorySnapshotToStorage(reduced);
                 return true;
             } catch (e2) {
                 console.error('立即保存历史记录失败（降级后）:', e2);
@@ -8743,6 +8776,7 @@ function TapnowApp() {
         body = null,
         modelId = '',
         pollPathHint = '',
+        projectId = '',
         maxAttempts,
         delayMs
     }) => {
@@ -8759,6 +8793,8 @@ function TapnowApp() {
         }
         requestHeaders['X-Target-Url'] = String(targetUrl);
         requestHeaders['X-Target-Method'] = String(targetMethod || 'POST').toUpperCase();
+        const effectiveProjectId = String(projectId || currentProject?.id || '').trim();
+        if (effectiveProjectId) requestHeaders['X-Project-Id'] = effectiveProjectId;
         if (modelId) requestHeaders['X-Model-Id'] = String(modelId);
         if (pollPathHint) requestHeaders['X-Poll-Path-Hint'] = String(pollPathHint);
         if (Number.isFinite(maxAttempts)) requestHeaders['X-Poll-Max-Attempts'] = String(maxAttempts);
@@ -8793,7 +8829,9 @@ function TapnowApp() {
             const backendTaskId = String(backendTaskIdRaw || '').trim();
             if (localToken && backendTaskId) {
                 try {
-                    const queryUrl = `${base}/video/tasks/recent?limit=1&task_id=${encodeURIComponent(backendTaskId)}`;
+                    const query = new URLSearchParams({ limit: '1', task_id: backendTaskId });
+                    if (effectiveProjectId) query.set('project_id', effectiveProjectId);
+                    const queryUrl = `${base}/video/tasks/recent?${query.toString()}`;
                     const taskResp = await fetch(queryUrl, {
                         method: 'GET',
                         headers: {
@@ -8822,7 +8860,7 @@ function TapnowApp() {
             return data;
         }
         return payload;
-    }, [localServerUrl, localServerToken, ensureLocalServerAuth]);
+    }, [localServerUrl, localServerToken, ensureLocalServerAuth, currentProject]);
 
     const getModelLabel = useCallback((modelId) => {
         if (!modelId) return '选择模型';
@@ -11068,7 +11106,7 @@ function TapnowApp() {
             const filtered = prev.filter(item => item.id !== id);
             // 立即保存到 localStorage，不等待防抖
             try {
-                localStorage.setItem('tapnow_history', JSON.stringify(filtered));
+                writeHistorySnapshotToStorage(filtered);
             } catch (e) {
                 console.error('立即保存历史记录失败:', e);
             }
@@ -19841,13 +19879,18 @@ function TapnowApp() {
     }, [localCacheActive, looksLikeProjectMediaUrl, normalizeProjectMediaUrlForSync, isLocalCacheUrl, isLocalCacheUrlAvailable, isVideoUrl, saveImageToLocalCache, saveVideoToLocalCache]);
     const applyProjectState = useCallback((state, fallbackProjectName = '') => {
         if (!state || typeof state !== 'object') return;
-        if (Array.isArray(state.nodes)) setNodes(state.nodes);
-        if (Array.isArray(state.connections)) setConnections(state.connections);
-        if (Array.isArray(state.history)) setHistory(state.history);
-        if (Array.isArray(state.chatSessions)) setChatSessions(state.chatSessions);
-        if (Array.isArray(state.characterLibrary)) setCharacterLibrary(state.characterLibrary);
+        setNodes(Array.isArray(state.nodes) ? state.nodes : []);
+        setConnections(Array.isArray(state.connections) ? state.connections : []);
+        setHistory(Array.isArray(state.history) ? state.history : []);
+        setChatSessions(Array.isArray(state.chatSessions) && state.chatSessions.length > 0
+            ? state.chatSessions
+            : [{ id: 'default', title: t('新对话'), messages: [] }]);
+        setCharacterLibrary(Array.isArray(state.characterLibrary) ? state.characterLibrary : []);
+        setView(state.view && typeof state.view === 'object'
+            ? { ...DEFAULT_VIEW, ...state.view }
+            : { ...DEFAULT_VIEW });
         setProjectName(state.projectName || fallbackProjectName || '未命名项目');
-    }, [setNodes, setConnections, setHistory, setChatSessions, setCharacterLibrary, setProjectName]);
+    }, [setNodes, setConnections, setHistory, setChatSessions, setCharacterLibrary, setProjectName, setView, t]);
     const buildProjectStatePayload = useCallback(() => {
         const raw = {
             nodes,
@@ -40078,7 +40121,7 @@ ${inputText.substring(0, 15000)} ... (截断)
                                                             const filtered = prev.filter(item => !batchSelectedIds.has(item.id));
                                                             // 立即保存到 localStorage，不等待防抖
                                                             try {
-                                                                localStorage.setItem('tapnow_history', JSON.stringify(filtered));
+                                                                writeHistorySnapshotToStorage(filtered);
                                                             } catch (e) {
                                                                 console.error('立即保存历史记录失败:', e);
                                                             }

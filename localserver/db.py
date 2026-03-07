@@ -654,14 +654,15 @@ class DatabaseManager:
             ).mappings().all()
             return [dict(r) for r in rows]
 
-    def write_audit(self, *, actor_user_id: Optional[str], action: str, target_type: str, target_id: str = "", payload: Optional[Dict[str, Any]] = None):
+    def write_audit(self, *, actor_user_id: Optional[str], action: str, target_type: str, target_id: str = "", payload: Optional[Dict[str, Any]] = None, project_id: Optional[str] = None):
         if not self.enabled:
             return
+        normalized_project_id = str(project_id or '').strip() or self.get_default_project_id()
         with self.connection() as conn:
             conn.execute(self.audit_logs.insert().values(
                 id=_new_id(),
                 actor_user_id=actor_user_id,
-                project_id=self.get_default_project_id(),
+                project_id=normalized_project_id,
                 action=action,
                 target_type=target_type,
                 target_id=target_id or None,
@@ -669,11 +670,12 @@ class DatabaseManager:
                 created_at=_now_ts(),
             ))
 
-    def list_recent_video_tasks(self, *, limit: int = 50, target_id: str = "") -> List[Dict[str, Any]]:
+    def list_recent_video_tasks(self, *, limit: int = 50, target_id: str = "", project_id: str = "") -> List[Dict[str, Any]]:
         if not self.enabled:
             return []
         safe_limit = max(1, min(int(limit or 50), 200))
         normalized_target_id = str(target_id or '').strip()
+        normalized_project_id = str(project_id or '').strip()
         where_clause = and_(
             self.audit_logs.c.target_type == 'video_job',
             self.audit_logs.c.action.in_([
@@ -682,6 +684,11 @@ class DatabaseManager:
                 'video_generate_timeout'
             ])
         )
+        if normalized_project_id:
+            where_clause = and_(
+                where_clause,
+                self.audit_logs.c.project_id == normalized_project_id
+            )
         if normalized_target_id:
             where_clause = and_(
                 where_clause,
@@ -705,6 +712,7 @@ class DatabaseManager:
             result.append({
                 'id': row.get('id'),
                 'action': row.get('action'),
+                'project_id': row.get('project_id') or '',
                 'target_id': row.get('target_id') or '',
                 'created_at': row.get('created_at') or 0,
                 'actor_user_id': row.get('actor_user_id') or '',

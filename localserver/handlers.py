@@ -128,14 +128,15 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             return None
         return user
 
-    def _audit(self, user, action, target_type, target_id='', payload=None):
+    def _audit(self, user, action, target_type, target_id='', payload=None, project_id=''):
         try:
             db_manager.write_audit(
                 actor_user_id=(user or {}).get('id') if isinstance(user, dict) else None,
                 action=action,
                 target_type=target_type,
                 target_id=target_id,
-                payload=payload or {}
+                payload=payload or {},
+                project_id=str(project_id or '').strip() or None
             )
         except Exception:
             pass
@@ -226,6 +227,7 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
     def handle_video_generate(self, parsed):
         user = self._get_current_user() if db_manager.enabled else None
         target_url = (self.headers.get('X-Target-Url') or parse_qs(parsed.query or '').get('url', [''])[0]).strip()
+        project_id = (self.headers.get('X-Project-Id') or parse_qs(parsed.query or '').get('project_id', [''])[0] or '').strip()
         if not target_url:
             self._send_json({"success": False, "error": "缺少 X-Target-Url"}, 400)
             return
@@ -309,7 +311,8 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                 'video_url': output_url.strip(),
                 'poll_path_hint': poll_path_hint,
                 'model_id': model_id,
-            })
+                'project_id': project_id,
+            }, project_id=project_id)
             self._send_json({"success": True, "data": submit_data, "video_url": output_url.strip()})
             return
 
@@ -402,7 +405,8 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                     'video_url': poll_output_url.strip(),
                     'poll_path_hint': poll_path_hint,
                     'model_id': model_id,
-                })
+                    'project_id': project_id,
+                }, project_id=project_id)
                 self._send_json({"success": True, "data": poll_data, "video_url": poll_output_url.strip(), "job_id": job_id})
                 return
 
@@ -420,7 +424,8 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                     'status': str(poll_status),
                     'poll_path_hint': poll_path_hint,
                     'model_id': model_id,
-                })
+                    'project_id': project_id,
+                }, project_id=project_id)
                 self._send_json({
                     "success": False,
                     "error": f"任务失败: {poll_status}",
@@ -438,7 +443,8 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
             'delay_ms': delay_ms,
             'poll_path_hint': poll_path_hint,
             'model_id': model_id,
-        })
+            'project_id': project_id,
+        }, project_id=project_id)
         self._send_json({"success": False, "error": "轮询超时", "job_id": job_id}, 504)
 
     def handle_get_recent_video_tasks(self, parsed):
@@ -458,8 +464,9 @@ class TapnowFullHandler(BaseHTTPRequestHandler):
                 limit = 50
             limit = max(1, min(limit, 200))
             task_id = str(params.get('task_id', [''])[0] or '').strip()
+            project_id = str(params.get('project_id', [''])[0] or '').strip()
 
-            items = db_manager.list_recent_video_tasks(limit=limit, target_id=task_id)
+            items = db_manager.list_recent_video_tasks(limit=limit, target_id=task_id, project_id=project_id)
             self._send_json({"success": True, "items": items})
         except Exception as e:
             self._send_json({"success": False, "error": str(e)}, 500)
