@@ -19764,7 +19764,21 @@ function TapnowApp() {
         if (!value || typeof value !== 'string') return '';
         const raw = String(value).trim();
         if (!raw) return '';
-        if (LocalImageManager.isImageId(raw) || raw.startsWith('asset://') || /^data:(image|video)\//i.test(raw)) {
+        if (/^data:(image|video)\//i.test(raw)) {
+            return raw;
+        }
+        if (LocalImageManager.isImageId(raw)) {
+            const resolvedImageSource = resolveSourceReferenceUrl(raw);
+            if (resolvedImageSource && resolvedImageSource !== raw) {
+                return normalizeProjectMediaUrlForSync(resolvedImageSource);
+            }
+            return '';
+        }
+        if (raw.startsWith('asset://')) {
+            const resolvedAsset = resolveSourceReferenceUrl(raw);
+            if (resolvedAsset && resolvedAsset !== raw) {
+                return normalizeProjectMediaUrlForSync(resolvedAsset);
+            }
             return raw;
         }
         if (raw.startsWith('blob:')) return '';
@@ -19782,7 +19796,7 @@ function TapnowApp() {
             if (typeof value === 'string') {
                 if (!looksLikeProjectMediaUrl(value, keyHint)) return value;
                 const normalized = normalizeProjectMediaUrlForSync(value);
-                return normalized || value;
+                return normalized || '';
             }
             if (Array.isArray(value)) return value.map((item) => walk(item, keyHint));
             if (!value || typeof value !== 'object') return value;
@@ -19904,16 +19918,28 @@ function TapnowApp() {
         return transformProjectStateForCrossDevice(raw);
     }, [nodes, connections, history, chatSessions, characterLibrary, projectName, transformProjectStateForCrossDevice]);
     const parseProjectStateTimestamp = useCallback((value) => {
-        if (typeof value === 'number' && Number.isFinite(value)) return value > 0 ? Math.floor(value) : 0;
+        if (typeof value === 'number' && Number.isFinite(value)) {
+            if (value <= 0) return 0;
+            const normalized = value > 1e12 ? Math.floor(value / 1000) : Math.floor(value);
+            return normalized > 0 ? normalized : 0;
+        }
         if (typeof value === 'string') {
             const trimmed = value.trim();
             if (!trimmed) return 0;
             const numeric = Number(trimmed);
-            if (Number.isFinite(numeric) && numeric > 0) return Math.floor(numeric);
+            if (Number.isFinite(numeric) && numeric > 0) {
+                const normalized = numeric > 1e12 ? Math.floor(numeric / 1000) : Math.floor(numeric);
+                return normalized > 0 ? normalized : 0;
+            }
             const dateMs = Date.parse(trimmed);
             if (Number.isFinite(dateMs) && dateMs > 0) return Math.floor(dateMs / 1000);
         }
         return 0;
+    }, []);
+    const parseProjectStateVersion = useCallback((value) => {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric) || numeric < 0) return 0;
+        return Math.floor(numeric);
     }, []);
     const saveProjectStateToLocalCache = useCallback((projectId, state, meta = {}) => {
         if (!projectId || !state) return;
@@ -19962,10 +19988,12 @@ function TapnowApp() {
             ? transformProjectStateForCrossDevice(cachedProjectData.state)
             : null;
         const cachedServerTs = parseProjectStateTimestamp(cachedProjectData?.serverUpdatedAt);
+        const cachedServerVersion = parseProjectStateVersion(cachedProjectData?.serverStateVersion);
 
         let serverProject = null;
         let serverState = null;
         let serverTs = 0;
+        let serverVersion = 0;
         if (projectId) {
             const baseUrl = (localServerUrl || '').replace(/\/+$/, '');
             try {
@@ -19980,6 +20008,7 @@ function TapnowApp() {
                             ? transformProjectStateForCrossDevice(data.project.current_state)
                             : null;
                         serverTs = parseProjectStateTimestamp(data.project.state_updated_at ?? data.project.updated_at);
+                        serverVersion = parseProjectStateVersion(data.project.state_version);
                     }
                 }
             } catch (e) {
@@ -19989,7 +20018,15 @@ function TapnowApp() {
 
         const hasCachedState = !!cachedState;
         const hasServerState = !!serverState;
-        const shouldUseServerState = hasServerState && (!hasCachedState || serverTs > cachedServerTs);
+        const serverVersionNewer = serverVersion > 0 && serverVersion > cachedServerVersion;
+        const serverTimestampNewer = serverTs > cachedServerTs;
+        const sameVersionButServerKnown = serverVersion > 0 && serverVersion === cachedServerVersion;
+        const shouldUseServerState = hasServerState && (
+            !hasCachedState
+            || serverVersionNewer
+            || serverTimestampNewer
+            || (sameVersionButServerKnown && serverTs >= cachedServerTs)
+        );
 
         if (shouldUseServerState) {
             applyProjectState(serverState, project?.name);
@@ -20023,7 +20060,7 @@ function TapnowApp() {
         }
 
         showToast('加载项目状态失败', 'error');
-    }, [localServerUrl, buildLocalServerHeaders, applyProjectState, readProjectStateFromLocalCache, saveProjectStateToLocalCache, showToast, transformProjectStateForCrossDevice, warmProjectMediaToLocalCache, parseProjectStateTimestamp]);
+    }, [localServerUrl, buildLocalServerHeaders, applyProjectState, readProjectStateFromLocalCache, saveProjectStateToLocalCache, showToast, transformProjectStateForCrossDevice, warmProjectMediaToLocalCache, parseProjectStateTimestamp, parseProjectStateVersion]);
 
     const handleCreateProject = useCallback(async (project) => {
         setCurrentProject(project);
